@@ -51,6 +51,8 @@ iframe{width:100%;height:100%;border:1px solid var(--line);border-radius:var(--r
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const AD={loading:'',ready:''}; // paste AdSense ad unit IDs (data-ad-slot) here; empty = no ad. Ads only show on the website, never in the APK
+const adHtml=k=>window.API_BASE||!AD[k]?'':`<ins class="adsbygoogle" style="display:block;min-height:100px;margin:32px 0 0" data-ad-client="ca-pub-4525280744585919" data-ad-slot="${AD[k]}" data-ad-format="auto" data-full-width-responsive="true"></ins>`;
 const FB={apiKey:"AIzaSyCsfkVxXgoK9pyLYXosWOo6Psq1BDgxYHE",authDomain:"sitepilot-4a887.firebaseapp.com",projectId:"sitepilot-4a887",appId:"1:956191151034:web:11554bf5b7eba11e10c383"};
 let user=null,auth=null;const KEY=()=>'sf.p'+(user?'.'+user.uid:''),load=()=>{try{return JSON.parse(localStorage.getItem(KEY())||'[]')}catch{return[]}},save=()=>{try{localStorage.setItem(KEY(),JSON.stringify(P))}catch{alert('Storage is full. Delete a project.')}};
 let img=null,P=load(),cur=null,view='home',tab='preview',pi=0,dev='390px',compare=null,busy=null;
@@ -70,7 +72,7 @@ async function generate(){const prompt=$('#pr').value.trim();if(prompt.length<3&
 window._retry='generate()';lastErr=null;setBusy(S,0);
 try{setBusy(S,1);let s=await api({mode:'generate',prompt:prompt||'Recreate the attached design',image:img});img=null;setBusy(S,2);let is=issues(s),warn='';
 if(is.length){try{const f=await api({mode:'edit',prompt:'Fix these issues without changing the design: '+is.join('; '),site:s,page:'/'});merge2(s,f.pages);}catch{}is=issues(s);if(is.length)warn='Generated with warnings: '+is.join(', ')}
-setBusy(S,3);cur={id:Date.now().toString(36),name:s.name||'Untitled',description:s.description,theme:s.theme,pages:s.pages,versions:[],updated:Date.now(),warn};snap('Initial website');P.unshift(cur);save();busy=null;pi=0;view='editor';tab='preview';render()}
+setBusy(S,3);cur={id:Date.now().toString(36),name:s.name||'Untitled',description:s.description,theme:s.theme,pages:s.pages,versions:[],updated:Date.now(),warn};snap('Initial website');P.unshift(cur);save();busy=null;pi=0;view='ready';tab='preview';render()}
 catch(e){lastErr=e;busy=null;render()}}
 function merge2(s,ch){ch.forEach(n=>{const i=s.pages.findIndex(p=>p.slug===n.slug);i<0?s.pages.push(n):s.pages[i]=n})}
 async function applyEdit(prompt,label){if(!prompt&&!img)return;const S=['Understanding','Editing','Saving'];setBusy(S,1);
@@ -79,7 +81,7 @@ const adding=/\bpage\b/i.test(prompt);const site={name:cur.name,theme:cur.theme,
 const d=await api({mode:'edit',prompt:prompt||'Match the attached image',site,page:pg.slug,image:img});img=null;const before=JSON.parse(JSON.stringify(cur.pages));merge(d.pages||[]);snap(label||d.summary||prompt.slice(0,50));cur.updated=Date.now();cur.prev=before;save();busy=null;toast=d.summary;render()}
 catch(e){busy=null;toast=e==='limit'?"You've reached the current AI generation limit.":e==='busy'?'The AI model is busy right now. Try again in a minute.':e==='auth'?'Your session expired. Sign in again.':'AI edit failed. Try again.';render()}}
 let toast='';
-function steps(){const{steps:S,i}=busy;return`<div class="wrap"><h1>${S[i]}…</h1><div class="bar2"><i></i></div><div class="steps">${S.map((s,k)=>`<div class="${k<i?'done':k==i?'on':''}">${k<i?'✓':'•'} ${s}</div>`).join('')}</div></div>`}
+function steps(){const{steps:S,i}=busy;return`<div class="wrap"><h1>${S[i]}…</h1><div class="bar2"><i></i></div><div class="steps">${S.map((s,k)=>`<div class="${k<i?'done':k==i?'on':''}">${k<i?'✓':'•'} ${s}</div>`).join('')}</div>${busy.steps[0]==='Planning'&&i===1?adHtml('loading'):''}</div>`}
 const imgBox=()=>`<div class="row" style="margin-top:8px"><button onclick="imgIn.click()">Add image</button><input type="file" id="imgIn" accept="image/png,image/jpeg,image/webp" hidden onchange="pick(this.files[0])">${img?`<img src="data:${img.mime};base64,${img.data}" alt="Attached reference" style="height:44px;border-radius:6px"><button onclick="img=null;render()">Remove</button>`:'<span class="mu" style="font-size:.85rem">Optional: screenshot or reference</span>'}</div>`;
 async function pick(f){if(!f)return;if(!/^image\/(png|jpeg|webp)$/.test(f.type)||f.size>10e6)return alert('Use a PNG, JPG or WebP image under 10 MB.');
 if($('#pr'))window._pr=$('#pr').value;if($('#ed'))window._ed=$('#ed').value;
@@ -117,6 +119,7 @@ const hs=Object.keys(files).filter(n=>/\.html$/i.test(n));if(!hs.length)throw 0;
 const pages=hs.map((n,i)=>{const h=files[n],b=(h.match(/<body[^>]*>([\s\S]*)<\/body>/i)||[0,h])[1].replace(/<script[\s\S]*?<\/script>/gi,'');const inl=(h.match(/<style[^>]*>([\s\S]*?)<\/style>/gi)||[]).join('').replace(/<\/?style[^>]*>/g,'');return{name:n.replace('.html',''),slug:n==='index.html'?'/':n.replace('.html',''),html:b,css:i?inl:css+inl,javascript:i?'':js}});
 cur={id:Date.now().toString(36),name:f.name.replace(/\.zip$/i,''),description:'Imported',theme:{},pages,versions:[],updated:Date.now()};snap('Imported website');P.unshift(cur);save();pi=0;view='editor';tab='preview';toast='Imported successfully';render()}catch{alert('Could not read that ZIP. It needs at least one .html file.')}}
 addEventListener('message',e=>{if(e.data?.sf&&cur){const h=String(e.data.sf).replace(/^\.?\//,''),i=cur.pages.findIndex(p=>fileOf(p)===h||(h===''&&p.slug==='/'));if(i>=0){pi=i;render()}}});
+function ready(){return`<div class="wrap"><h1>Your website is ready.</h1><p class="mu">${esc(cur.name)}${cur.description?' - '+esc(cur.description):''}</p>${cur.warn?`<p class="err">${esc(cur.warn)}</p>`:''}<div class="row" style="margin-top:12px"><button class="p g" onclick="view='editor';tab='preview';render()">Preview</button><button class="g" onclick="view='editor';tab='ai';render()">Edit with AI</button></div><div class="row" style="margin-top:8px"><button class="g" onclick="view='editor';tab='code';render()">View Code</button><button class="g" onclick="exportZip()">Export</button></div>${adHtml('ready')}</div>`}
 const WV=/; wv\)/.test(navigator.userAgent);
 function account(){
 if(!auth)return`<div class="wrap"><h1>Account</h1><div class="card"><b>Login is not set up yet</b><p class="mu">Add your Firebase config in index.html to turn on sign-in. You can keep using SitePilot as a guest.</p></div></div>`;
@@ -127,10 +130,10 @@ const authErr=x=>setMsg({'auth/invalid-credential':'Wrong email or password.','a
 async function authGo(m){const e=$('#em').value.trim(),p=$('#pw').value;setMsg('');try{m==='up'?await auth.createUserWithEmailAndPassword(e,p):await auth.signInWithEmailAndPassword(e,p)}catch(x){authErr(x)}}
 async function google(){setMsg('');try{await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider())}catch(x){authErr(x)}}
 async function forgot(){const e=$('#em').value.trim();if(!e)return setMsg('Enter your email first.');try{await auth.sendPasswordResetEmail(e);setMsg('')||alert('Password reset email sent.')}catch(x){authErr(x)}}
-if(FB.apiKey&&window.firebase){firebase.initializeApp(FB);auth=firebase.auth();auth.onAuthStateChanged(u=>{user=u;P=load();cur=null;if(view==='editor'||view==='account')view='home';render()})}
+if(FB.apiKey&&window.firebase){firebase.initializeApp(FB);auth=firebase.auth();auth.onAuthStateChanged(u=>{user=u;P=load();cur=null;if(view==='editor'||view==='account'||view==='ready')view='home';render()})}
 function render(){const m=$('#main');m.style.padding=view==='editor'?'12px 16px 0':'16px';$('#nav').style.display=view==='editor'||busy?'none':'flex';
 $('#nav').innerHTML=[['home','Home'],['projects','Projects'],['account',user?'Account':'Sign in']].map(([k,n])=>`<button class="${view==k?'on':''}" onclick="view='${k}';render()">${n}</button>`).join('');
-m.innerHTML=busy?steps():view==='home'?home():view==='projects'?projects():view==='account'?account():editor()}
+m.innerHTML=busy?steps():view==='home'?home():view==='projects'?projects():view==='account'?account():view==='ready'?ready():editor();m.querySelectorAll('ins.adsbygoogle').forEach(()=>{try{(window.adsbygoogle=window.adsbygoogle||[]).push({})}catch{}})}
 render();
 </script>
 </body>
