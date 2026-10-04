@@ -13,6 +13,13 @@ const SCHEMA = {
 const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel default)
 
 async function handler(req, res) {
+  if (req.method === 'GET' && req.query && req.query.models) { // diagnostic: which models can this key use?
+    try {
+      const l = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', { headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' } });
+      const d = await l.json();
+      return res.status(200).json({ status: l.status, models: (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name), error: d.error && d.error.message });
+    } catch (e) { return res.status(500).json({ error: 'list' }); }
+  }
   if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: !!process.env.GEMINI_API_KEY });
   const key = process.env.GEMINI_API_KEY;
   if (!key) return res.status(500).json({ error: 'config' });
@@ -35,8 +42,7 @@ async function handler(req, res) {
     : `Existing site (name, theme, pages):\n${JSON.stringify(site)}\nCurrent page slug: ${page || '/'}\nRequested change: ${prompt}\nReturn ONLY pages that changed or are new (full code for each), plus a short summary of the change. Keep the design system and navigation consistent; if adding a page, also return the other pages with updated navigation.`;
 
   try {
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    const call = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify({
@@ -45,9 +51,14 @@ async function handler(req, res) {
           { text: text + (image ? '\nAn image is attached. Analyze its layout, spacing, typography, colors, cards, buttons and sections and build a similar but ORIGINAL implementation. Do not copy logos, brand names, copyrighted assets or proprietary text.' : '') },
           ...(image ? [{ inlineData: { mimeType: image.mime, data: image.data } }] : []),
         ] }],
-        generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA[mode], temperature: 0.7, maxOutputTokens: 32000, thinkingConfig: { thinkingBudget: 0 } },
+        generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA[mode], temperature: 0.7, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
       }),
     });
+    let r;
+    for (const m of [process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'].filter(Boolean)) {
+      r = await call(m);
+      if (r.status !== 404) break; // model not found: try the next one
+    }
     if (r.status === 429) return res.status(429).json({ error: 'limit' });
     if (!r.ok) { console.error('Gemini HTTP', r.status, (await r.text()).slice(0, 500)); return res.status(502).json({ error: 'ai', status: r.status }); }
     const data = await r.json();
