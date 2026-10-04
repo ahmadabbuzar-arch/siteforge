@@ -55,9 +55,9 @@ async function handler(req, res) {
       }),
     });
     let r;
-    for (const m of [process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'].filter(Boolean)) {
+    for (const m of [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-flash-latest'].filter(Boolean)) {
       r = await call(m);
-      if (r.status !== 404) break; // model not found: try the next one
+      if (r.status !== 404 && r.status !== 403) break; // model missing/not allowed: try the next one
     }
     if (r.status === 429) return res.status(429).json({ error: 'limit' });
     if (!r.ok) { console.error('Gemini HTTP', r.status, (await r.text()).slice(0, 500)); return res.status(502).json({ error: 'ai', status: r.status }); }
