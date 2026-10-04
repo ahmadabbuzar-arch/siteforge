@@ -1,4 +1,15 @@
 // Vercel serverless route (CommonJS so it works without package.json settings). Env: GEMINI_API_KEY (required), GEMINI_MODEL, DAILY_LIMIT
+const FBKEY = process.env.FIREBASE_API_KEY; // Firebase web API key (used only to verify login tokens)
+async function whoIs(req) {
+  const t = String(req.headers.authorization || '').replace(/^Bearer /, '');
+  if (!t) return { guest: true };
+  if (!FBKEY) return { bad: true };
+  try {
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FBKEY}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken: t }) });
+    const u = r.ok && (await r.json()).users;
+    return u && u[0] ? { uid: u[0].localId } : { bad: true };
+  } catch (e) { return { bad: true }; }
+}
 const hits = new Map(); // in-memory per-IP counter; use Firebase/Upstash for real limits
 
 const SYSTEM = `You are a professional web developer. Generate clean, responsive, accessible HTML/CSS/JavaScript. Maintain the existing design system when editing. Do not remove existing functionality unless explicitly requested. Return valid structured JSON. Never include markdown code fences inside code fields.
@@ -15,7 +26,7 @@ const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel d
 async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*'); // lets the APK (file/localhost origin) call this API
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method === 'GET' && req.query && req.query.models) { // diagnostic: which models can this key use?
     try {
@@ -35,9 +46,11 @@ async function handler(req, res) {
     return res.status(400).json({ error: 'image' });
   if (JSON.stringify(site || {}).length > 400000) return res.status(413).json({ error: 'size' });
 
+  const who = await whoIs(req);
+  if (who.bad) return res.status(401).json({ error: 'auth' });
   const ip = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim();
-  const day = new Date().toISOString().slice(0, 10), k = ip + day;
-  const limit = Number(process.env.DAILY_LIMIT || 10), used = hits.get(k) || 0;
+  const day = new Date().toISOString().slice(0, 10), k = (who.uid ? 'u:' + who.uid : 'ip:' + ip) + day;
+  const limit = who.uid ? Number(process.env.DAILY_LIMIT || 10) : Number(process.env.GUEST_LIMIT || 3), used = hits.get(k) || 0;
   if (used >= limit) return res.status(429).json({ error: 'limit', remaining: 0 });
   hits.set(k, used + 1);
 
