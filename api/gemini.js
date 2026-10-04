@@ -55,16 +55,18 @@ async function handler(req, res) {
       }),
     });
     let r;
-    for (const m of [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-flash-latest'].filter(Boolean)) {
+    const wait = (ms) => new Promise((x) => setTimeout(x, ms));
+    for (const m of [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean)) {
       r = await call(m);
-      if (r.status !== 404 && r.status !== 403) break; // model missing/not allowed: try the next one
+      if (r.status === 503 || r.status === 500) { await wait(1500); r = await call(m); } // overloaded: one quick retry
+      if (![403, 404, 429, 500, 503].includes(r.status)) break; // otherwise try the next model
     }
     if (r.status === 429) return res.status(429).json({ error: 'limit' });
+    if (r.status === 503) return res.status(503).json({ error: 'busy' });
     if (!r.ok) {
       const t = (await r.text()).slice(0, 600);
       console.error('Gemini HTTP', r.status, t);
-      let msg = ''; try { msg = JSON.parse(t).error.message; } catch (e) {}
-      return res.status(502).json({ error: 'ai', status: r.status, detail: String(msg).slice(0, 160) }); // detail: temporary debugging aid
+      return res.status(502).json({ error: 'ai', status: r.status }); // msg stays in server logs only
     }
     const data = await r.json();
     const out = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
