@@ -60,7 +60,12 @@ async function handler(req, res) {
       if (r.status !== 404 && r.status !== 403) break; // model missing/not allowed: try the next one
     }
     if (r.status === 429) return res.status(429).json({ error: 'limit' });
-    if (!r.ok) { console.error('Gemini HTTP', r.status, (await r.text()).slice(0, 500)); return res.status(502).json({ error: 'ai', status: r.status }); }
+    if (!r.ok) {
+      const t = (await r.text()).slice(0, 600);
+      console.error('Gemini HTTP', r.status, t);
+      let msg = ''; try { msg = JSON.parse(t).error.message; } catch (e) {}
+      return res.status(502).json({ error: 'ai', status: r.status, detail: String(msg).slice(0, 160) }); // detail: temporary debugging aid
+    }
     const data = await r.json();
     const out = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
     const parsed = JSON.parse(out.replace(/^```json|```$/g, '').trim());
