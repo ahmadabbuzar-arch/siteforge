@@ -52,13 +52,13 @@ const CHIPS={'Business Website':'A professional business website for a local con
 const fileOf=p=>p.slug==='/'||p.slug==='index'?'index.html':p.slug.replace(/^\/|\.html$/g,'')+'.html';
 const allCss=s=>s.pages.map(p=>p.css).join('\n');
 const doc=(s,p,preview)=>`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(s.name)} - ${esc(p.name)}</title>${preview?`<style>${allCss(s)}</style>`:'<link rel="stylesheet" href="style.css">'}</head><body>${p.html}${preview?`<script>document.addEventListener('click',e=>{const a=e.target.closest('a[href]');if(!a)return;const h=a.getAttribute('href');if(/\\.html$/.test(h)||h==='/'){e.preventDefault();parent.postMessage({sf:h},'*')}});${p.javascript.replace(/<\/script/gi,'<\\/script')}<\/script>`:'<script src="script.js"><\/script>'}</body></html>`;
-async function api(body){let r;try{r=await fetch('/api/gemini',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}catch{throw'ai'}
-const d=await r.json().catch(()=>({}));if(!r.ok)throw d.error==='limit'?'limit':'ai';if(d.remaining!=null)$('#rem').textContent='AI generations remaining: '+d.remaining;return d}
+async function api(body){let r;window._dbg='';try{r=await fetch('/api/gemini',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}catch{window._dbg='network';throw'ai'}
+const d=await r.json().catch(()=>({}));if(!r.ok){window._dbg=r.status+(d.status?'/'+d.status:'')+(d.error?' '+d.error:'');console.error('API error',r.status,d);throw d.error==='limit'?'limit':'ai'}if(d.remaining!=null)$('#rem').textContent='AI generations remaining: '+d.remaining;return d}
 const issues=s=>{const i=[];if(!s.pages?.length)return['no pages'];s.pages.forEach(p=>{if(!p.html||p.html.length<40)i.push(p.name+': empty page');if(/<html|<body/i.test(p.html))i.push(p.name+': contains full document tags')});if(!/@media/.test(allCss(s)))i.push('no media queries');if(/width:\s*\d{4,}px/.test(allCss(s)))i.push('fixed wide layout');return i};
 const snap=(label)=>{cur.versions.push({label,t:Date.now(),pages:JSON.parse(JSON.stringify(cur.pages))});cur.versions=cur.versions.slice(-10)};
 const merge=ch=>{ch.forEach(n=>{const i=cur.pages.findIndex(p=>p.slug===n.slug);i<0?cur.pages.push(n):cur.pages[i]=n})};
 function setBusy(steps,i,msg){busy={steps,i,msg};render()}
-const errBox=(e,retry)=>`<div class="card"><p class="err">${e==='limit'?"You've reached the current AI generation limit.":'AI generation failed. Try again.'}</p><div class="row"><button class="p" onclick="${retry}">Retry</button><button onclick="busy=null;render()">Edit prompt</button></div></div>`;
+const errBox=(e,retry)=>`<div class="card"><p class="err">${e==='limit'?"You've reached the current AI generation limit.":'AI generation failed. Try again.'}</p>${window._dbg?`<p class="mu" style="font-size:.8rem">Code: ${esc(window._dbg)}</p>`:''}<div class="row"><button class="p" onclick="${retry}">Retry</button><button onclick="busy=null;render()">Edit prompt</button></div></div>`;
 let lastErr=null;
 async function generate(){const prompt=$('#pr').value.trim();if(prompt.length<3&&!img)return;const S=['Planning','Generating','Validating','Finishing'];
 window._retry='generate()';lastErr=null;setBusy(S,0);
