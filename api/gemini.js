@@ -13,6 +13,10 @@ const SCHEMA = {
 const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel default)
 
 async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // lets the APK (file/localhost origin) call this API
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method === 'GET' && req.query && req.query.models) { // diagnostic: which models can this key use?
     try {
       const l = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', { headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' } });
