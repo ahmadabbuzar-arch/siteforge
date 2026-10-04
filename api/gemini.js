@@ -1,4 +1,4 @@
-// Vercel serverless route. Env: GEMINI_API_KEY (required), GEMINI_MODEL, DAILY_LIMIT
+// Vercel serverless route (CommonJS so it works without package.json settings). Env: GEMINI_API_KEY (required), GEMINI_MODEL, DAILY_LIMIT
 const hits = new Map(); // in-memory per-IP counter; use Firebase/Upstash for real limits
 
 const SYSTEM = `You are a professional web developer. Generate clean, responsive, accessible HTML/CSS/JavaScript. Maintain the existing design system when editing. Do not remove existing functionality unless explicitly requested. Return valid structured JSON. Never include markdown code fences inside code fields.
@@ -10,9 +10,9 @@ const SCHEMA = {
   edit: { type: 'OBJECT', properties: { summary: { type: 'STRING' }, pages: { type: 'ARRAY', items: PAGE } }, required: ['summary', 'pages'] },
 };
 
-export const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel default)
+const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel default)
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: !!process.env.GEMINI_API_KEY });
   const key = process.env.GEMINI_API_KEY;
   if (!key) return res.status(500).json({ error: 'config' });
@@ -59,3 +59,6 @@ export default async function handler(req, res) {
     return res.status(502).json({ error: 'ai' });
   }
 }
+
+module.exports = handler;
+module.exports.config = config;
