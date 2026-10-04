@@ -15,7 +15,7 @@ async function handler(req, res) {
   const token = process.env.VERCEL_TOKEN;
   if (!token) return res.status(501).json({ error: 'config' });
 
-  const { name, pub, files } = req.body || {};
+  const { name, pub, files, assets } = req.body || {};
   const entries = files && typeof files === 'object' ? Object.entries(files) : [];
   if (!entries.length || entries.length > 30 || typeof files['index.html'] !== 'string') return res.status(400).json({ error: 'input' });
   let total = 0;
@@ -23,7 +23,13 @@ async function handler(req, res) {
     if (!/^[a-z0-9-]+\.(html|css|js)$/i.test(f) || typeof c !== 'string') return res.status(400).json({ error: 'input' });
     total += c.length;
   }
-  if (total > 3_000_000) return res.status(413).json({ error: 'size' });
+  const assetEntries = assets && typeof assets === 'object' ? Object.entries(assets) : [];
+  if (assetEntries.length > 12) return res.status(400).json({ error: 'input' });
+  for (const [f, c] of assetEntries) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,60}\.(jpg|png|webp)$/.test(f) || typeof c !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(c)) return res.status(400).json({ error: 'input' });
+    total += c.length;
+  }
+  if (total > 4_000_000) return res.status(413).json({ error: 'size' });
 
   const ip = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim();
   const k = ip + new Date().toISOString().slice(0, 10), used = hits.get(k) || 0;
@@ -43,7 +49,7 @@ async function handler(req, res) {
   try {
     const r = await fetch(`https://api.vercel.com/v13/deployments?forceNew=1${team ? '&' + team : ''}`, {
       method: 'POST', headers,
-      body: JSON.stringify({ name: proj, target: 'production', projectSettings: { framework: null }, files: entries.map(([file, data]) => ({ file, data })) }),
+      body: JSON.stringify({ name: proj, target: 'production', projectSettings: { framework: null }, files: [...entries.map(([file, data]) => ({ file, data })), ...assetEntries.map(([f, c]) => ({ file: 'assets/' + f, data: c, encoding: 'base64' }))] }),
     });
     const d = await r.json();
     if (!r.ok) { console.error('Vercel deploy', r.status, JSON.stringify(d).slice(0, 500)); return res.status(502).json({ error: 'publish', status: r.status }); }
