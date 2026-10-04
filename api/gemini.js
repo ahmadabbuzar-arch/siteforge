@@ -29,11 +29,12 @@ async function handler(req, res) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return res.status(500).json({ error: 'config' });
 
-  const { mode, prompt, site, page, image } = req.body || {};
+  const { mode, prompt, site, page, image, assets } = req.body || {};
   if (!['generate', 'edit'].includes(mode) || typeof prompt !== 'string' || (prompt.trim().length < 3 && !image) || prompt.length > 4000)
     return res.status(400).json({ error: 'input' });
   if (image && (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mime) || typeof image.data !== 'string' || image.data.length > 3_000_000 || !/^[A-Za-z0-9+/=]+$/.test(image.data)))
     return res.status(400).json({ error: 'image' });
+  if (assets && (!Array.isArray(assets) || assets.length > 12 || assets.some((a) => !/^assets\/[a-z0-9._-]{1,70}$/.test(a)))) return res.status(400).json({ error: 'input' });
   if (JSON.stringify(site || {}).length > 400000) return res.status(413).json({ error: 'size' });
 
   const ip = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim();
@@ -42,7 +43,7 @@ async function handler(req, res) {
   if (used >= limit) return res.status(429).json({ error: 'limit', remaining: 0 });
 
   const text = mode === 'generate'
-    ? `Create a complete multi-page-ready website (at least a Home page; add About/Contact etc. only if useful).\nRequest: ${prompt}`
+    ? `Create a complete multi-page-ready website (at least a Home page; add About/Contact etc. only if useful).\nRequest: ${prompt}` + (assets && assets.length ? `\nThe user uploaded images, available at these exact paths: ${assets.join(', ')}. Use them with <img src="..." alt="..."> where they fit (for example a profile photo, hero or logo). Never redraw, recreate or replace them with illustrations or SVG, and never invent other image files.` : '')
     : `Existing site (name, theme, pages):\n${JSON.stringify(site)}\nCurrent page slug: ${page || '/'}\nRequested change: ${prompt}\nReturn ONLY pages that changed or are new (full code for each), plus a short summary of the change. If site.assets lists uploaded images, use them only by their exact path (for example <img src="assets/logo.webp" alt="...">) when the user asks to use their image, and never invent other image files. Keep the design system and navigation consistent; if adding a page, also return the other pages with updated navigation.`;
 
   try {
