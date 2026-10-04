@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14151a">
+<title>SiteForge AI</title>
+<style>
+:root{--bg:#14151a;--panel:#1b1d24;--line:#2a2d37;--tx:#e8e9ee;--mu:#9a9fae;--ac:#6c7bff;--r:10px}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--tx);font:16px/1.5 Inter,system-ui,sans-serif;display:flex;flex-direction:column;padding-top:env(safe-area-inset-top)}
+button,input,textarea{font:inherit;color:inherit}
+button{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);min-height:44px;padding:0 14px;cursor:pointer}
+button.p{background:var(--ac);border-color:var(--ac);color:#fff;font-weight:600}
+button:focus-visible,textarea:focus-visible,input:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+button:disabled{opacity:.5}
+textarea,input{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:12px}
+header{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line)}
+header b{font-size:1.05rem}.logo{width:26px;height:26px}
+main{flex:1;overflow:auto;padding:16px;min-height:0}
+.wrap{max-width:720px;margin:0 auto}
+h1{font-size:1.7rem;line-height:1.2;margin:8px 0}.mu{color:var(--mu)}
+nav.bar{display:flex;border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav.bar button{flex:1;border:0;border-radius:0;background:none;color:var(--mu)}
+nav.bar button.on{color:var(--tx);box-shadow:inset 0 2px var(--ac)}
+.chips{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;padding:12px 0}
+.chips button{white-space:nowrap;border-radius:99px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin:10px 0}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>.g{flex:1}
+.steps div{padding:6px 0;color:var(--mu)}.steps .on{color:var(--tx)}.steps .done{color:var(--ac)}
+.bar2{height:3px;background:var(--line);overflow:hidden;border-radius:2px;margin:12px 0}
+.bar2 i{display:block;height:100%;width:35%;background:var(--ac);animation:s 1.1s ease-in-out infinite}
+@keyframes s{from{margin-left:-35%}to{margin-left:100%}}
+@media(prefers-reduced-motion:reduce){.bar2 i{animation:none;width:100%}}
+iframe{width:100%;height:100%;border:1px solid var(--line);border-radius:var(--r);background:#fff}
+.stage{height:100%;display:flex;flex-direction:column;gap:8px}.frame{flex:1;min-height:0;display:flex;justify-content:center}
+.frame iframe{max-width:100%;transition:width .2s}
+#code{height:55vh;font:13px/1.45 ui-monospace,monospace;white-space:pre;overflow:auto;resize:none}
+.err{color:#ff9b9b}
+</style>
+</head>
+<body>
+<header><svg class="logo" viewBox="0 0 26 26" fill="none" stroke="#6c7bff" stroke-width="2"><rect x="2" y="3" width="22" height="20" rx="4"/><path d="M2 9h22M9 9v14"/></svg><b>SiteForge AI</b><span class="mu" style="margin-left:auto;font-size:.8rem" id="rem"></span></header>
+<main id="main"></main>
+<nav class="bar" id="nav"></nav>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const load=()=>{try{return JSON.parse(localStorage.getItem('sf.p')||'[]')}catch{return[]}},save=()=>{try{localStorage.setItem('sf.p',JSON.stringify(P))}catch{alert('Storage is full. Delete a project.')}};
+let img=null,P=load(),cur=null,view='home',tab='preview',pi=0,dev='390px',compare=null,busy=null;
+const CHIPS={'Business Website':'A professional business website for a local consulting firm with services, team, pricing and a contact form.','Portfolio':'A modern portfolio website for a video editor with showreel section, projects grid and contact.','Restaurant':'A modern restaurant website with menu, pricing, gallery, location and WhatsApp booking.','Salon':'A salon website with services, price list, booking section and opening hours.','Landing Page':'A landing page for a habit-tracking app with features, pricing and a signup form.','Gaming':'A gaming community website with news, events, leaderboard and a Discord join section.','Event':'A one-page event website for a tech meetup with schedule, speakers and registration.','Online Store':'An online store homepage for handmade candles with product grid, about and contact.'};
+const fileOf=p=>p.slug==='/'||p.slug==='index'?'index.html':p.slug.replace(/^\/|\.html$/g,'')+'.html';
+const allCss=s=>s.pages.map(p=>p.css).join('\n');
+const doc=(s,p,preview)=>`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(s.name)} - ${esc(p.name)}</title>${preview?`<style>${allCss(s)}</style>`:'<link rel="stylesheet" href="style.css">'}</head><body>${p.html}${preview?`<script>document.addEventListener('click',e=>{const a=e.target.closest('a[href]');if(!a)return;const h=a.getAttribute('href');if(/\\.html$/.test(h)||h==='/'){e.preventDefault();parent.postMessage({sf:h},'*')}});${p.javascript.replace(/<\/script/gi,'<\\/script')}<\/script>`:'<script src="script.js"><\/script>'}</body></html>`;
+async function api(body){let r;try{r=await fetch('/api/gemini',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}catch{throw'ai'}
+const d=await r.json().catch(()=>({}));if(!r.ok)throw d.error==='limit'?'limit':'ai';if(d.remaining!=null)$('#rem').textContent='AI generations remaining: '+d.remaining;return d}
+const issues=s=>{const i=[];if(!s.pages?.length)return['no pages'];s.pages.forEach(p=>{if(!p.html||p.html.length<40)i.push(p.name+': empty page');if(/<html|<body/i.test(p.html))i.push(p.name+': contains full document tags')});if(!/@media/.test(allCss(s)))i.push('no media queries');if(/width:\s*\d{4,}px/.test(allCss(s)))i.push('fixed wide layout');return i};
+const snap=(label)=>{cur.versions.push({label,t:Date.now(),pages:JSON.parse(JSON.stringify(cur.pages))});cur.versions=cur.versions.slice(-10)};
+const merge=ch=>{ch.forEach(n=>{const i=cur.pages.findIndex(p=>p.slug===n.slug);i<0?cur.pages.push(n):cur.pages[i]=n})};
+function setBusy(steps,i,msg){busy={steps,i,msg};render()}
+const errBox=(e,retry)=>`<div class="card"><p class="err">${e==='limit'?"You've reached the current AI generation limit.":'AI generation failed. Try again.'}</p><div class="row"><button class="p" onclick="${retry}">Retry</button><button onclick="busy=null;render()">Edit prompt</button></div></div>`;
+let lastErr=null;
+async function generate(){const prompt=$('#pr').value.trim();if(prompt.length<3&&!img)return;const S=['Planning','Generating','Validating','Finishing'];
+window._retry='generate()';lastErr=null;setBusy(S,0);
+try{setBusy(S,1);let s=await api({mode:'generate',prompt:prompt||'Recreate the attached design',image:img});img=null;setBusy(S,2);let is=issues(s),warn='';
+if(is.length){try{const f=await api({mode:'edit',prompt:'Fix these issues without changing the design: '+is.join('; '),site:s,page:'/'});merge2(s,f.pages);}catch{}is=issues(s);if(is.length)warn='Generated with warnings: '+is.join(', ')}
+setBusy(S,3);cur={id:Date.now().toString(36),name:s.name||'Untitled',description:s.description,theme:s.theme,pages:s.pages,versions:[],updated:Date.now(),warn};snap('Initial website');P.unshift(cur);save();busy=null;pi=0;view='editor';tab='preview';render()}
+catch(e){lastErr=e;busy=null;render()}}
+function merge2(s,ch){ch.forEach(n=>{const i=s.pages.findIndex(p=>p.slug===n.slug);i<0?s.pages.push(n):s.pages[i]=n})}
+async function applyEdit(prompt,label){if(!prompt&&!img)return;const S=['Understanding','Editing','Saving'];setBusy(S,1);
+try{const pg=cur.pages[pi],others=cur.pages.map(p=>({name:p.name,slug:p.slug}));
+const adding=/\bpage\b/i.test(prompt);const site={name:cur.name,theme:cur.theme,pages:adding?cur.pages:[pg],pageList:others};
+const d=await api({mode:'edit',prompt:prompt||'Match the attached image',site,page:pg.slug,image:img});img=null;const before=JSON.parse(JSON.stringify(cur.pages));merge(d.pages||[]);snap(label||d.summary||prompt.slice(0,50));cur.updated=Date.now();cur.prev=before;save();busy=null;toast=d.summary;render()}
+catch(e){busy=null;toast=e==='limit'?"You've reached the current AI generation limit.":'AI edit failed. Try again.';render()}}
+let toast='';
+function steps(){const{steps:S,i}=busy;return`<div class="wrap"><h1>${S[i]}…</h1><div class="bar2"><i></i></div><div class="steps">${S.map((s,k)=>`<div class="${k<i?'done':k==i?'on':''}">${k<i?'✓':'•'} ${s}</div>`).join('')}</div></div>`}
+const imgBox=()=>`<div class="row" style="margin-top:8px"><button onclick="imgIn.click()">Add image</button><input type="file" id="imgIn" accept="image/png,image/jpeg,image/webp" hidden onchange="pick(this.files[0])">${img?`<img src="data:${img.mime};base64,${img.data}" alt="Attached reference" style="height:44px;border-radius:6px"><button onclick="img=null;render()">Remove</button>`:'<span class="mu" style="font-size:.85rem">Optional: screenshot or reference</span>'}</div>`;
+async function pick(f){if(!f)return;if(!/^image\/(png|jpeg|webp)$/.test(f.type)||f.size>10e6)return alert('Use a PNG, JPG or WebP image under 10 MB.');
+if($('#pr'))window._pr=$('#pr').value;if($('#ed'))window._ed=$('#ed').value;
+try{const b=await createImageBitmap(f),k=Math.min(1,1024/Math.max(b.width,b.height)),c=document.createElement('canvas');c.width=Math.round(b.width*k);c.height=Math.round(b.height*k);c.getContext('2d').drawImage(b,0,0,c.width,c.height);img={mime:'image/jpeg',data:c.toDataURL('image/jpeg',.8).split(',')[1]};render()}catch{alert('Could not read that image.')}}
+function home(){return`<div class="wrap"><h1>${P.length?'Build a website with AI':'Build your first website'}</h1><p class="mu">${P.length?'Describe what you want. SiteForge will create the website for you.':'What do you want to build?'}</p>
+<textarea id="pr" rows="4" placeholder="Describe your website..." maxlength="4000">${esc(window._pr||'')}</textarea>
+${imgBox()}<div class="row" style="margin-top:10px"><button class="p g" onclick="window._pr=$('#pr').value;generate()">Generate Website</button><button onclick="importZip.click()">Import ZIP</button><input type="file" id="importZip" accept=".zip" hidden onchange="imp(this.files[0])"></div>
+<div class="chips">${Object.keys(CHIPS).map(k=>`<button onclick="$('#pr').value=CHIPS['${k}'];window._pr=CHIPS['${k}']">${k}</button>`).join('')}</div>${lastErr?errBox(lastErr,'generate()'):''}
+<p class="mu" style="font-size:.85rem">Describe it. Build it. Ship it.</p></div>`}
+function projects(){return`<div class="wrap"><div class="row"><h1 class="g">My Projects</h1><button class="p" onclick="view='home';render()">+ New</button></div>${P.length?P.map(p=>`<div class="card"><b>${esc(p.name)}</b><div class="mu" style="font-size:.85rem">${p.pages.length} page${p.pages.length>1?'s':''} · edited ${new Date(p.updated).toLocaleString()}</div><div class="row" style="margin-top:8px"><button onclick="openP('${p.id}')">Open</button><button onclick="ren('${p.id}')">Rename</button><button onclick="dup('${p.id}')">Duplicate</button><button onclick="del('${p.id}')">Delete</button></div></div>`).join(''):`<div class="card"><b>No websites yet</b><p class="mu">Create your first website with AI.</p><button class="p" onclick="view='home';render()">Create Website</button></div>`}</div>`}
+const openP=id=>{cur=P.find(p=>p.id===id);pi=0;view='editor';tab='preview';render()};
+const ren=id=>{const p=P.find(x=>x.id===id),n=prompt('Project name',p.name);if(n){p.name=n.slice(0,60);save();render()}};
+const dup=id=>{const p=JSON.parse(JSON.stringify(P.find(x=>x.id===id)));p.id=Date.now().toString(36);p.name+=' copy';P.unshift(p);save();render()};
+const del=id=>{if(confirm('Delete this project?')){P=P.filter(p=>p.id!==id);save();render()}};
+function editor(){const pg=cur.pages[pi]||cur.pages[0];const T=['preview','pages','ai','code'];
+let body='';
+if(tab==='preview'){const s=compare?{...cur,pages:compare}:cur,p=s.pages[pi]||s.pages[0];
+body=`<div class="stage">${cur.warn?`<div class="err" style="font-size:.85rem">${esc(cur.warn)} You can fix it in the Code tab.</div>`:''}<div class="row">${[['Mobile','390px'],['Tablet','768px'],['Desktop','100%']].map(([n,w])=>`<button style="${dev===w?'border-color:var(--ac)':''}" onclick="dev='${w}';render()">${n}</button>`).join('')}<button onclick="render()">Refresh</button><span class="mu g"></span>${compare?'<b class="mu">Showing: Before</b>':''}</div><div class="frame"><iframe title="Preview" sandbox="allow-scripts" style="width:${dev}" srcdoc="${esc(doc(s,p,true))}"></iframe></div></div>`}
+if(tab==='pages')body=`<div class="wrap">${cur.pages.map((p,i)=>`<button style="width:100%;margin:4px 0;text-align:left;${i==pi?'border-color:var(--ac)':''}" onclick="pi=${i};tab='preview';render()">${esc(p.name)} <span class="mu">${fileOf(p)}</span></button>`).join('')}<div class="card"><label for="np">+ Add Page</label><input id="np" placeholder="Create a pricing page"><button class="p" style="margin-top:8px;width:100%" onclick="addPage()">Add with AI</button></div></div>`;
+if(tab==='ai')body=`<div class="wrap"><h2>Edit with AI</h2><textarea id="ed" rows="3" placeholder="Tell AI what to change...">${esc(window._ed||'')}</textarea>${imgBox()}<div class="chips">${['Make the hero section blue','Add a testimonials section','Change the font','Add a WhatsApp button'].map(x=>`<button onclick="$('#ed').value='${x}'">${x}</button>`).join('')}</div><button class="p" style="width:100%" onclick="applyEdit($('#ed').value.trim())">Apply Changes</button>
+${cur.prev?`<div class="row" style="margin-top:10px"><button onclick="compare=cur.prev;tab='preview';render()">Before</button><button onclick="compare=null;tab='preview';render()">After</button><button onclick="undo()">Undo</button></div>`:''}
+<h3>Versions</h3>${cur.versions.slice().reverse().map((v,i)=>{const n=cur.versions.length-i-1;return`<div class="card row"><span class="g">Version ${n+1}<br><span class="mu" style="font-size:.85rem">${esc(v.label)}</span></span><button onclick="compare=cur.versions[${n}].pages;tab='preview';render()">Preview</button><button onclick="restore(${n})">Restore</button></div>`}).join('')}</div>`;
+if(tab==='code')body=`<div class="wrap"><div class="row">${['html','css','javascript'].map(k=>`<button style="${(window._k||'html')===k?'border-color:var(--ac)':''}" onclick="window._k='${k}';render()">${k.toUpperCase()}</button>`).join('')}</div><textarea id="code" spellcheck="false" style="margin:8px 0">${esc(pg[window._k||'html'])}</textarea><div class="row"><button class="p" onclick="saveCode()">Save Changes</button><button onclick="navigator.clipboard.writeText($('#code').value)">Copy Code</button></div></div>`;
+return`<div style="display:flex;flex-direction:column;height:100%"><div class="row" style="padding-bottom:8px"><button onclick="view='projects';render()" aria-label="Back">←</button><b class="g">${esc(cur.name)}</b><button onclick="exportZip()">Export ZIP</button><button onclick="expHtml()">HTML</button></div>${toast?`<div class="card" style="margin:0 0 8px">${esc(toast)}</div>`:''}<div style="flex:1;min-height:0;overflow:auto">${body}</div><nav class="bar" style="margin:0 -16px -16px">${T.map(t=>`<button class="${tab==t?'on':''}" onclick="tab='${t}';toast='';render()">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}</nav></div>`}
+function saveCode(){const k=window._k||'html';snap('Manual code edit');cur.pages[pi][k]=$('#code').value;cur.updated=Date.now();cur.prev=null;save();tab='preview';toast='';render()}
+function undo(){if(!cur.prev)return;cur.pages=cur.prev;cur.prev=null;compare=null;save();render()}
+function restore(n){snap('Before restore');cur.pages=JSON.parse(JSON.stringify(cur.versions[n].pages));cur.updated=Date.now();save();tab='preview';compare=null;render()}
+function addPage(){const v=$('#np').value.trim();if(v){tab='ai';applyEdit('Add a new page: '+v+'. Add it to the navigation on every page.','Added page: '+v)}}
+async function build(){const z=new JSZip();cur.pages.forEach(p=>z.file(fileOf(p),doc(cur,p,false)));z.file('style.css',allCss(cur));z.file('script.js',cur.pages.map(p=>p.javascript).join('\n'));z.folder('assets');return z}
+const dl=(b,n)=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000)};
+async function exportZip(){dl(await(await build()).generateAsync({type:'blob'}),(cur.name||'site').replace(/\W+/g,'-')+'.zip')}
+function expHtml(){const p=cur.pages[pi],s=cur;dl(new Blob([`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(s.name)}</title><style>${allCss(s)}</style></head><body>${p.html}<script>${p.javascript.replace(/<\/script/gi,'<\\/script')}<\/script></body></html>`],{type:'text/html'}),fileOf(p))}
+async function imp(f){if(!f||f.size>5e6)return alert('Choose a ZIP under 5 MB.');try{const z=await JSZip.loadAsync(f),files={};for(const n in z.files){if(z.files[n].dir||!/\.(html|css|js)$/i.test(n))continue;files[n.split('/').pop()]=await z.files[n].async('string')}
+const hs=Object.keys(files).filter(n=>/\.html$/i.test(n));if(!hs.length)throw 0;const css=Object.keys(files).filter(n=>/\.css$/i.test(n)).map(n=>files[n]).join('\n'),js=Object.keys(files).filter(n=>/\.js$/i.test(n)).map(n=>files[n]).join('\n');
+const pages=hs.map((n,i)=>{const h=files[n],b=(h.match(/<body[^>]*>([\s\S]*)<\/body>/i)||[0,h])[1].replace(/<script[\s\S]*?<\/script>/gi,'');const inl=(h.match(/<style[^>]*>([\s\S]*?)<\/style>/gi)||[]).join('').replace(/<\/?style[^>]*>/g,'');return{name:n.replace('.html',''),slug:n==='index.html'?'/':n.replace('.html',''),html:b,css:i?inl:css+inl,javascript:i?'':js}});
+cur={id:Date.now().toString(36),name:f.name.replace(/\.zip$/i,''),description:'Imported',theme:{},pages,versions:[],updated:Date.now()};snap('Imported website');P.unshift(cur);save();pi=0;view='editor';tab='preview';toast='Imported successfully';render()}catch{alert('Could not read that ZIP. It needs at least one .html file.')}}
+addEventListener('message',e=>{if(e.data?.sf&&cur){const h=String(e.data.sf).replace(/^\.?\//,''),i=cur.pages.findIndex(p=>fileOf(p)===h||(h===''&&p.slug==='/'));if(i>=0){pi=i;render()}}});
+function render(){const m=$('#main');m.style.padding=view==='editor'?'12px 16px 0':'16px';$('#nav').style.display=view==='editor'||busy?'none':'flex';
+$('#nav').innerHTML=[['home','Home'],['projects','Projects']].map(([k,n])=>`<button class="${view==k?'on':''}" onclick="view='${k}';render()">${n}</button>`).join('');
+m.innerHTML=busy?steps():view==='home'?home():view==='projects'?projects():editor()}
+render();
+</script>
+</body>
+</html>
