@@ -43,7 +43,7 @@ async function handler(req, res) {
     const out = [];
     for (const [ki, k] of geminiKeys().entries()) {
       const results = [];
-      for (const m of [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash'].filter(Boolean)) {
+      for (const m of [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-3.5-flash'].filter(Boolean))]) {
         try {
           const t = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
             method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
@@ -61,7 +61,7 @@ async function handler(req, res) {
   const keys = geminiKeys();
   if (!keys.length && !process.env.GROQ_API_KEY) return res.status(500).json({ error: 'config' });
 
-  const { mode, prompt, site, page, image, assets } = req.body || {};
+  const { mode, prompt, site, page, image, assets, backup } = req.body || {};
   if (!['generate', 'edit'].includes(mode) || typeof prompt !== 'string' || (prompt.trim().length < 3 && !image) || prompt.length > 4000)
     return res.status(400).json({ error: 'input' });
   if (image && (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mime) || typeof image.data !== 'string' || image.data.length > 3_000_000 || !/^[A-Za-z0-9+/=]+$/.test(image.data)))
@@ -82,56 +82,57 @@ async function handler(req, res) {
   let gfail = null;
   const viaGemini = async () => {
     if (!keys.length) return { code: 502, body: { error: 'ai', why: 'nokey' } };
-    try {
-    const call = (model, k) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: 'user', parts: [
-          { text: text + (image ? '\nAn image is attached. Analyze its layout, spacing, typography, colors, cards, buttons and sections and build a similar but ORIGINAL implementation. Do not copy logos, brand names, copyrighted assets or proprietary text.' : '') },
-          ...(image ? [{ inlineData: { mimeType: image.mime, data: image.data } }] : []),
-        ] }],
-        generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA[mode], temperature: 0.7, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
-      }),
-    });
-      let r, busyAny = false;
-      const wait = (ms) => new Promise((x) => setTimeout(x, ms));
-      const models = [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean);
-      const KEYFAIL = [401, 403], NEXTMODEL = [400, 404, 429, 500, 503];
-      const rounds = process.env.GROQ_API_KEY ? 1 : 3, t0 = Date.now(), budget = 35000;
-      // Order: key 1 (all models), then key 2 (all models); Groq is only the very last resort (see viaGroq)
-      outer: for (let round = 0; round < rounds; round++) {
-        let busy = false;
-        for (const k of keys) {
-          for (const m of models) {
-            r = await call(m, k);
-            gnotes.push((keys.indexOf(k) + 1) + ':' + r.status);
-            if (r.ok) break outer;
-            if (KEYFAIL.includes(r.status)) break; // this key is rejected or blocked: go to the next key
-            if (!NEXTMODEL.includes(r.status)) break outer; // some other error: report it
-            if (r.status === 500 || r.status === 503) busy = busyAny = true;
+  const call = (model, k, ms) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
+    signal: AbortSignal.timeout(ms),
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM }] },
+      contents: [{ role: 'user', parts: [
+        { text: text + (image ? '\nAn image is attached. Analyze its layout, spacing, typography, colors, cards, buttons and sections and build a similar but ORIGINAL implementation. Do not copy logos, brand names, copyrighted assets or proprietary text.' : '') },
+        ...(image ? [{ inlineData: { mimeType: image.mime, data: image.data } }] : []),
+      ] }],
+      generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA[mode], temperature: 0.7, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+    }),
+  });
+    // Newest Gemini models first (2.5 models now return 404 for new users). Duplicates removed.
+    const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.5-flash'].filter(Boolean))];
+    const hasGroq = !!process.env.GROQ_API_KEY, t0 = Date.now(), STOP = hasGroq ? 30000 : 45000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
+    const wait = (ms) => new Promise((x) => setTimeout(x, ms));
+    let busyAny = false, sawLimit = false, last = null;
+    for (let round = 0; round < (hasGroq ? 1 : 3); round++) {
+      let busy = false;
+      for (const [ki, k] of keys.entries()) { // key 1 first, then key 2; Groq is only the very last resort
+        for (const m of models) {
+          const elapsed = Date.now() - t0;
+          if (elapsed > STOP) break;
+          let r;
+          try { r = await call(m, k, STOP + 12000 - elapsed); }
+          catch (e) { gnotes.push(`${ki + 1}:${m.replace('gemini-', '')}:timeout`); continue; }
+          gnotes.push(`${ki + 1}:${m.replace('gemini-', '')}:${r.status}`);
+          if (r.ok) {
+            const data = await r.json().catch(() => ({}));
+            const cand = data?.candidates?.[0];
+            const out = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
+            if (out) {
+              try { return { parsed: JSON.parse(out.replace(/^```json|```$/g, '').trim()), via: 'gemini' }; }
+              catch (e) { console.error('JSON parse failed', m, cand?.finishReason, out.slice(-200)); gnotes.push('parse-' + (cand?.finishReason || '')); }
+            } else gnotes.push('empty-' + (cand?.finishReason || data?.promptFeedback?.blockReason || 'none'));
+            last = { code: 502, body: { error: 'ai', why: 'unusable output' } };
+            continue; // unusable answer: try the next model
           }
+          if (r.status === 500 || r.status === 503) busy = busyAny = true;
+          else if (r.status === 429) sawLimit = true;
+          else { console.error('Gemini HTTP', m, r.status, (await r.text().catch(() => '')).slice(0, 300)); last = { code: 502, body: { error: 'ai', status: r.status } }; }
+          if (r.status === 401 || r.status === 403) break; // this key is rejected or blocked: go to the next key
         }
-        if (!busy || Date.now() - t0 > budget || round === rounds - 1) break;
-        await wait(3000 * (round + 1));
       }
-      if (!r.ok && busyAny) return { code: 503, body: { error: 'busy' } };
-      if (r.status === 429) return { code: 429, body: { error: 'limit' } };
-      if (!r.ok) {
-        console.error('Gemini HTTP', r.status, (await r.text()).slice(0, 600));
-        return { code: 502, body: { error: 'ai', status: r.status } }; // message stays in server logs only
-      }
-      const data = await r.json();
-      const cand = data?.candidates?.[0];
-      const out = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
-      if (!out) return { code: 502, body: { error: 'ai', why: 'empty ' + (cand?.finishReason || data?.promptFeedback?.blockReason || 'none') } };
-      try { return { parsed: JSON.parse(out.replace(/^```json|```$/g, '').trim()), via: 'gemini' }; }
-      catch (e) { console.error('JSON parse failed', cand?.finishReason, out.slice(-200)); return { code: 502, body: { error: 'ai', why: 'parse ' + (cand?.finishReason || '') } }; }
-    } catch (e) {
-      console.error('Gemini fetch failed:', e);
-      return { code: 502, body: { error: 'ai', why: 'fetch' } };
+      if (!busy || Date.now() - t0 > STOP || round === (hasGroq ? 0 : 2)) break;
+      await wait(3000 * (round + 1));
     }
+    if (busyAny) return { code: 503, body: { error: 'busy' } };
+    if (sawLimit) return { code: 429, body: { error: 'limit' } };
+    return last || { code: 502, body: { error: 'ai', why: 'no model' } };
   };
 
   // Backup provider: used only when Gemini failed. Env: GROQ_API_KEY (optional), GROQ_MODEL, GROQ_MAX_TOKENS
@@ -173,11 +174,19 @@ async function handler(req, res) {
     return null;
   };
 
-  let result = await viaGemini();
-  if (!result.parsed) {
-    gfail = [...new Set(gnotes)].join(' ') + (result.body && result.body.why ? ' ' + result.body.why : '');
-    const g = await viaGroq();
-    if (g) result = g;
+  // Gemini first. If it fails and a backup AI exists, do NOT switch silently: tell the app (error 'fallback') so the user can choose.
+  // The app then re-sends with backup:true, which goes straight to the backup AI.
+  const hasBackup = !!process.env.GROQ_API_KEY && !image;
+  let result;
+  if (backup === true && hasBackup) {
+    result = (await viaGroq()) || { code: 503, body: { error: 'busy' } };
+  } else {
+    result = await viaGemini();
+    if (!result.parsed) {
+      gfail = [...new Set(gnotes)].join(' ') + (result.body && result.body.why ? ' ' + result.body.why : '');
+      console.error('Gemini failed:', gfail);
+      if (hasBackup) result = { code: 503, body: { error: 'fallback' } };
+    }
   }
   if (!result.parsed) return res.status(result.code).json(result.body);
   hits.set(k, used + 1); // only successful results count against the limit
