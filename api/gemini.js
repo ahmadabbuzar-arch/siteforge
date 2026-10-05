@@ -36,6 +36,27 @@ async function handler(req, res) {
       return res.status(200).json({ status: l.status, models: (d.data || []).map((m) => m.id), error: d.error && d.error.message });
     } catch (e) { return res.status(500).json({ error: 'list' }); }
   }
+  if (req.method === 'GET' && req.query && req.query.test) { // diagnostic: why is Gemini failing? (tiny real request per key/model)
+    const ip0 = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim(), tk = 'test' + ip0 + new Date().toISOString().slice(0, 10), tu = hits.get(tk) || 0;
+    if (tu >= 10) return res.status(429).json({ error: 'limit' });
+    hits.set(tk, tu + 1);
+    const out = [];
+    for (const [ki, k] of geminiKeys().entries()) {
+      const results = [];
+      for (const m of [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash'].filter(Boolean)) {
+        try {
+          const t = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
+            body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Return summary "ok" and an empty pages array.' }] }], generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA.edit, maxOutputTokens: 32000 } }),
+          });
+          let msg = ''; if (!t.ok) { try { msg = (await t.json()).error.message.slice(0, 140); } catch (e) {} }
+          results.push({ model: m, status: t.status, msg });
+        } catch (e) { results.push({ model: m, status: 'fetch failed' }); }
+      }
+      out.push({ key: ki + 1, results });
+    }
+    return res.status(200).json({ groq: !!process.env.GROQ_API_KEY, keys: out });
+  }
   if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: geminiKeys().length > 0, geminiKeys: geminiKeys().length, groq: !!process.env.GROQ_API_KEY });
   const keys = geminiKeys();
   if (!keys.length && !process.env.GROQ_API_KEY) return res.status(500).json({ error: 'config' });
@@ -57,6 +78,8 @@ async function handler(req, res) {
     ? `Create a complete multi-page-ready website (at least a Home page; add About/Contact etc. only if useful).\nRequest: ${prompt}` + (assets && assets.length ? `\nThe user uploaded images, available at these exact paths: ${assets.join(', ')}. Use them with <img src="..." alt="..."> where they fit (for example a profile photo, hero or logo). Never redraw, recreate or replace them with illustrations or SVG, and never invent other image files. Show them in their original colors: no grayscale, sepia, blur or brightness filters, no mix-blend-mode, no color overlays or reduced opacity on them.` : '')
     : `Existing site (name, theme, pages):\n${JSON.stringify(site)}\nCurrent page slug: ${page || '/'}\nRequested change: ${prompt}\nReturn ONLY pages that changed or are new (full code for each), plus a short summary of the change. If site.assets lists uploaded images, use them only by their exact path (for example <img src="assets/logo.webp" alt="...">) when the user asks to use their image, and never invent other image files. Show uploaded images in their original colors: do not add grayscale, sepia, blur or brightness filters, blend modes, color overlays or reduced opacity to them. Keep the design system and navigation consistent; if adding a page, also return the other pages with updated navigation.`;
 
+  const gnotes = [];
+  let gfail = null;
   const viaGemini = async () => {
     if (!keys.length) return { code: 502, body: { error: 'ai', why: 'nokey' } };
     try {
@@ -75,7 +98,7 @@ async function handler(req, res) {
       let r, busyAny = false;
       const wait = (ms) => new Promise((x) => setTimeout(x, ms));
       const models = [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean);
-      const KEYFAIL = [400, 401, 403], NEXTMODEL = [404, 429, 500, 503];
+      const KEYFAIL = [401, 403], NEXTMODEL = [400, 404, 429, 500, 503];
       const rounds = process.env.GROQ_API_KEY ? 1 : 3, t0 = Date.now(), budget = 35000;
       // Order: key 1 (all models), then key 2 (all models); Groq is only the very last resort (see viaGroq)
       outer: for (let round = 0; round < rounds; round++) {
@@ -83,6 +106,7 @@ async function handler(req, res) {
         for (const k of keys) {
           for (const m of models) {
             r = await call(m, k);
+            gnotes.push((keys.indexOf(k) + 1) + ':' + r.status);
             if (r.ok) break outer;
             if (KEYFAIL.includes(r.status)) break; // this key is rejected or blocked: go to the next key
             if (!NEXTMODEL.includes(r.status)) break outer; // some other error: report it
@@ -151,12 +175,13 @@ async function handler(req, res) {
 
   let result = await viaGemini();
   if (!result.parsed) {
+    gfail = [...new Set(gnotes)].join(' ') + (result.body && result.body.why ? ' ' + result.body.why : '');
     const g = await viaGroq();
     if (g) result = g;
   }
   if (!result.parsed) return res.status(result.code).json(result.body);
   hits.set(k, used + 1); // only successful results count against the limit
-  return res.status(200).json({ ...result.parsed, via: result.via, ...(mode === 'generate' ? { remaining: Math.max(0, limit - used - 1) } : {}) });
+  return res.status(200).json({ ...result.parsed, via: result.via, ...(result.via === 'groq' ? { gemini: gfail } : {}), ...(mode === 'generate' ? { remaining: Math.max(0, limit - used - 1) } : {}) });
 }
 
 module.exports = handler;
