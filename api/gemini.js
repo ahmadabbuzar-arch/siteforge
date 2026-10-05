@@ -1,6 +1,8 @@
 // Vercel serverless route (CommonJS so it works without package.json settings).
 // Env: GEMINI_API_KEY (required), GEMINI_MODEL; optional backup: GROQ_API_KEY, GROQ_MODEL, GROQ_MAX_TOKENS
 let groqCache = { t: 0, ids: null };
+// Gemini keys in order of use: GEMINI_API_KEY, then GEMINI_API_KEY_2 (also accepts _2 variants, _BACKUP, or a comma list in GEMINI_API_KEYS)
+const geminiKeys = () => [...new Set(['GEMINI_API_KEY', 'GEMINI_API_KEY_2', 'GEMINI_API_KEY2', 'GEMINI_API_KEY_BACKUP', 'GEMINI_API_KEY_B'].map((n) => process.env[n]).concat((process.env.GEMINI_API_KEYS || '').split(',')).map((x) => (x || '').trim()).filter(Boolean))];
 const hits = new Map(); // in-memory per-IP counter (resets on cold start); use Upstash/Firebase for strict limits
 // Env: GENERATE_LIMIT = abuse backstop per IP per day (default 100; the per-user limit of 5 is in index.html), EDIT_LIMIT = AI edits per IP per day (default 30)
 
@@ -22,7 +24,7 @@ async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method === 'GET' && req.query && req.query.models) { // diagnostic: which models can this key use?
     try {
-      const l = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', { headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY || '' } });
+      const l = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', { headers: { 'x-goog-api-key': geminiKeys()[0] || '' } });
       const d = await l.json();
       return res.status(200).json({ status: l.status, models: (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name), error: d.error && d.error.message });
     } catch (e) { return res.status(500).json({ error: 'list' }); }
@@ -34,9 +36,9 @@ async function handler(req, res) {
       return res.status(200).json({ status: l.status, models: (d.data || []).map((m) => m.id), error: d.error && d.error.message });
     } catch (e) { return res.status(500).json({ error: 'list' }); }
   }
-  if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: !!process.env.GEMINI_API_KEY });
-  const key = process.env.GEMINI_API_KEY;
-  if (!key && !process.env.GROQ_API_KEY) return res.status(500).json({ error: 'config' });
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: geminiKeys().length > 0, geminiKeys: geminiKeys().length, groq: !!process.env.GROQ_API_KEY });
+  const keys = geminiKeys();
+  if (!keys.length && !process.env.GROQ_API_KEY) return res.status(500).json({ error: 'config' });
 
   const { mode, prompt, site, page, image, assets } = req.body || {};
   if (!['generate', 'edit'].includes(mode) || typeof prompt !== 'string' || (prompt.trim().length < 3 && !image) || prompt.length > 4000)
@@ -56,11 +58,11 @@ async function handler(req, res) {
     : `Existing site (name, theme, pages):\n${JSON.stringify(site)}\nCurrent page slug: ${page || '/'}\nRequested change: ${prompt}\nReturn ONLY pages that changed or are new (full code for each), plus a short summary of the change. If site.assets lists uploaded images, use them only by their exact path (for example <img src="assets/logo.webp" alt="...">) when the user asks to use their image, and never invent other image files. Show uploaded images in their original colors: do not add grayscale, sepia, blur or brightness filters, blend modes, color overlays or reduced opacity to them. Keep the design system and navigation consistent; if adding a page, also return the other pages with updated navigation.`;
 
   const viaGemini = async () => {
-    if (!key) return { code: 502, body: { error: 'ai', why: 'nokey' } };
+    if (!keys.length) return { code: 502, body: { error: 'ai', why: 'nokey' } };
     try {
-    const call = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    const call = (model, k) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM }] },
         contents: [{ role: 'user', parts: [
@@ -73,15 +75,21 @@ async function handler(req, res) {
       let r, busyAny = false;
       const wait = (ms) => new Promise((x) => setTimeout(x, ms));
       const models = [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean);
-      const RETRY = [403, 404, 429, 500, 503], t0 = Date.now(), rounds = process.env.GROQ_API_KEY ? 1 : 3, budget = 35000; // with a Groq backup, give up on Gemini after one pass
-      for (let round = 0; round < rounds; round++) { // all models busy? wait a little and go around again
+      const KEYFAIL = [400, 401, 403], NEXTMODEL = [404, 429, 500, 503];
+      const rounds = process.env.GROQ_API_KEY ? 1 : 3, t0 = Date.now(), budget = 35000;
+      // Order: key 1 (all models), then key 2 (all models); Groq is only the very last resort (see viaGroq)
+      outer: for (let round = 0; round < rounds; round++) {
         let busy = false;
-        for (const m of models) {
-          r = await call(m);
-          if (!RETRY.includes(r.status)) break;
-          if (r.status === 500 || r.status === 503) busy = busyAny = true;
+        for (const k of keys) {
+          for (const m of models) {
+            r = await call(m, k);
+            if (r.ok) break outer;
+            if (KEYFAIL.includes(r.status)) break; // this key is rejected or blocked: go to the next key
+            if (!NEXTMODEL.includes(r.status)) break outer; // some other error: report it
+            if (r.status === 500 || r.status === 503) busy = busyAny = true;
+          }
         }
-        if (!RETRY.includes(r.status) || !busy || Date.now() - t0 > budget || round === rounds - 1) break;
+        if (!busy || Date.now() - t0 > budget || round === rounds - 1) break;
         await wait(3000 * (round + 1));
       }
       if (!r.ok && busyAny) return { code: 503, body: { error: 'busy' } };
