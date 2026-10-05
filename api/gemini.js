@@ -59,13 +59,21 @@ async function handler(req, res) {
         generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA[mode], temperature: 0.7, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
       }),
     });
-    let r;
+    let r, busyAny = false;
     const wait = (ms) => new Promise((x) => setTimeout(x, ms));
-    for (const m of [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean)) {
-      r = await call(m);
-      if (r.status === 503 || r.status === 500) { await wait(1500); r = await call(m); } // overloaded: one quick retry
-      if (![403, 404, 429, 500, 503].includes(r.status)) break; // otherwise try the next model
+    const models = [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean);
+    const RETRY = [403, 404, 429, 500, 503], t0 = Date.now();
+    for (let round = 0; round < 3; round++) { // all models busy? wait a little and go around again
+      let busy = false;
+      for (const m of models) {
+        r = await call(m);
+        if (!RETRY.includes(r.status)) break;
+        if (r.status === 500 || r.status === 503) busy = busyAny = true;
+      }
+      if (!RETRY.includes(r.status) || !busy || Date.now() - t0 > 35000) break;
+      await wait(3000 * (round + 1));
     }
+    if (!r.ok && busyAny) return res.status(503).json({ error: 'busy' });
     if (r.status === 429) return res.status(429).json({ error: 'limit' });
     if (r.status === 503) return res.status(503).json({ error: 'busy' });
     if (!r.ok) {
