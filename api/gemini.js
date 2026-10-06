@@ -1,6 +1,8 @@
 // Vercel serverless route (CommonJS so it works without package.json settings).
 // Env: GEMINI_API_KEY (required), GEMINI_MODEL; optional backup: GROQ_API_KEY, GROQ_MODEL, GROQ_MAX_TOKENS
 let groqCache = { t: 0, ids: null };
+// Gemini 3.x: low thinking (faster, leaves room for the JSON); older 2.5 models: thinking off. Temperature left at the default for 3.x.
+const genConfig = (model, schema, lowThink) => ({ responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { temperature: 0.7, thinkingConfig: { thinkingBudget: 0 } } : lowThink ? { thinkingConfig: { thinkingLevel: 'low' } } : {}) });
 // Gemini keys in order of use: GEMINI_API_KEY, then GEMINI_API_KEY_2 (also accepts _2 variants, _BACKUP, or a comma list in GEMINI_API_KEYS)
 const geminiKeys = () => [...new Set(['GEMINI_API_KEY', 'GEMINI_API_KEY_2', 'GEMINI_API_KEY2', 'GEMINI_API_KEY_BACKUP', 'GEMINI_API_KEY_B'].map((n) => process.env[n]).concat((process.env.GEMINI_API_KEYS || '').split(',')).map((x) => (x || '').trim()).filter(Boolean))];
 const hits = new Map(); // in-memory per-IP counter (resets on cold start); use Upstash/Firebase for strict limits
@@ -35,6 +37,24 @@ async function handler(req, res) {
       const d = await l.json();
       return res.status(200).json({ status: l.status, models: (d.data || []).map((m) => m.id), error: d.error && d.error.message });
     } catch (e) { return res.status(500).json({ error: 'list' }); }
+  }
+  if (req.method === 'GET' && req.query && req.query.test === 'full') { // diagnostic: one REAL website generation with the first key, shows timing, tokens and whether the JSON is usable
+    const ip1 = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim(), fk = 'full' + ip1 + new Date().toISOString().slice(0, 10), fu = hits.get(fk) || 0;
+    if (fu >= 6) return res.status(429).json({ error: 'limit' });
+    hits.set(fk, fu + 1);
+    const keys1 = geminiKeys(), kn = Math.min(Math.max(Number(req.query.key) || 1, 1), keys1.length || 1), model1 = String(req.query.model || process.env.GEMINI_MODEL || 'gemini-3.8-flash');
+    if (!/^[a-z0-9.-]{3,60}$/.test(model1) || !keys1.length) return res.status(400).json({ error: 'input' });
+    const t1 = Date.now();
+    try {
+      const t = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model1}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': keys1[kn - 1] }, signal: AbortSignal.timeout(55000),
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: 'user', parts: [{ text: 'Create a complete multi-page-ready website (at least a Home page; add About/Contact etc. only if useful).\nRequest: A modern portfolio website for a video editor with showreel section, projects grid and contact.' }] }], generationConfig: genConfig(model1, SCHEMA.generate, true) }),
+      });
+      const j = await t.json().catch(() => ({}));
+      const c = j.candidates && j.candidates[0], txt = ((c && c.content && c.content.parts) || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
+      let parsedOk = false; try { parsedOk = Array.isArray(JSON.parse(txt).pages); } catch (e) {}
+      return res.status(200).json({ key: kn, model: model1, status: t.status, seconds: Math.round((Date.now() - t1) / 1000), finishReason: c && c.finishReason, parsedOk, outChars: txt.length, usage: j.usageMetadata, error: j.error && String(j.error.message).slice(0, 200) });
+    } catch (e) { return res.status(200).json({ key: kn, model: model1, error: 'failed or timed out', seconds: Math.round((Date.now() - t1) / 1000) }); }
   }
   if (req.method === 'GET' && req.query && req.query.test) { // diagnostic: why is Gemini failing? (tiny real request per key/model)
     const ip0 = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim(), tk = 'test' + ip0 + new Date().toISOString().slice(0, 10), tu = hits.get(tk) || 0;
@@ -82,7 +102,7 @@ async function handler(req, res) {
   let gfail = null;
   const viaGemini = async () => {
     if (!keys.length) return { code: 502, body: { error: 'ai', why: 'nokey' } };
-  const call = (model, k, ms) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+  const call = (model, k, ms, lowThink) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
     signal: AbortSignal.timeout(ms),
@@ -92,12 +112,12 @@ async function handler(req, res) {
         { text: text + (image ? '\nAn image is attached. Analyze its layout, spacing, typography, colors, cards, buttons and sections and build a similar but ORIGINAL implementation. Do not copy logos, brand names, copyrighted assets or proprietary text.' : '') },
         ...(image ? [{ inlineData: { mimeType: image.mime, data: image.data } }] : []),
       ] }],
-      generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA[mode], temperature: 0.7, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}) },
+      generationConfig: genConfig(model, SCHEMA[mode], lowThink),
     }),
   });
     // Newest Gemini models first (2.5 models now return 404 for new users). Duplicates removed.
     const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.5-flash'].filter(Boolean))];
-    const hasGroq = !!process.env.GROQ_API_KEY, t0 = Date.now(), STOP = hasGroq ? 30000 : 45000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
+    const hasGroq = !!process.env.GROQ_API_KEY, t0 = Date.now(), STOP = 42000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
     const wait = (ms) => new Promise((x) => setTimeout(x, ms));
     let busyAny = false, sawLimit = false, last = null;
     for (let round = 0; round < (hasGroq ? 1 : 3); round++) {
@@ -107,7 +127,10 @@ async function handler(req, res) {
           const elapsed = Date.now() - t0;
           if (elapsed > STOP) break;
           let r;
-          try { r = await call(m, k, STOP + 12000 - elapsed); }
+          try {
+            r = await call(m, k, Math.max(5000, 55000 - elapsed), true);
+            if (r.status === 400) r = await call(m, k, Math.max(5000, 55000 - (Date.now() - t0)), false); // thinkingLevel not accepted by this model? retry without it
+          }
           catch (e) { gnotes.push(`${ki + 1}:${m.replace('gemini-', '')}:timeout`); continue; }
           gnotes.push(`${ki + 1}:${m.replace('gemini-', '')}:${r.status}`);
           if (r.ok) {
@@ -186,6 +209,7 @@ async function handler(req, res) {
       gfail = [...new Set(gnotes)].join(' ') + (result.body && result.body.why ? ' ' + result.body.why : '');
       console.error('Gemini failed:', gfail);
       if (hasBackup) result = { code: 503, body: { error: 'fallback' } };
+      result = { ...result, body: { ...result.body, why: gfail.trim() } }; // short codes only; shown in the app's Code line
     }
   }
   if (!result.parsed) return res.status(result.code).json(result.body);
