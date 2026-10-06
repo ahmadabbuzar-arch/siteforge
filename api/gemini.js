@@ -19,6 +19,79 @@ const SCHEMA = {
 
 const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel default)
 
+// ---------- Backup AI (Groq): staged build for better quality ----------
+const DESIGN = 'Design rules: modern premium look, generous whitespace, 8px spacing scale, fluid type with clamp(), one primary accent colour from the theme used sparingly, soft borders, subtle shadows, rounded cards, clear visual hierarchy, a strong hero, consistent buttons, hover and focus states, smooth subtle transitions, mobile-first with breakpoints, no horizontal overflow, readable contrast, no lorem ipsum, no external fonts or images.';
+async function groqModelList(gk) { // newest production model first, then newest preview, then the small one (checked against Groq's live catalogue, cached 10 min)
+  if (!groqCache.ids || Date.now() - groqCache.t > 600000) {
+    try {
+      const l = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: 'Bearer ' + gk } });
+      if (l.ok) groqCache = { t: Date.now(), ids: ((await l.json()).data || []).map((x) => x.id) };
+    } catch (e) {}
+  }
+  const avail = groqCache.ids;
+  const pref = [process.env.GROQ_MODEL, 'openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-20b'].filter(Boolean);
+  let list = avail ? pref.filter((m) => avail.includes(m)) : pref;
+  if (avail && list.length < 2) list = [...list, ...avail.filter((m) => !/whisper|guard|tts|compound|embed|orpheus|vision/i.test(m) && !list.includes(m)).slice(0, 2)];
+  return list;
+}
+async function groqJson(sys, user, maxTokens) {
+  const gk = process.env.GROQ_API_KEY;
+  if (!gk) return null;
+  for (const m of await groqModelList(gk)) {
+    try {
+      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + gk },
+        body: JSON.stringify({ model: m, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }], temperature: 0.6, max_tokens: maxTokens, response_format: { type: 'json_object' } }),
+      });
+      if (!r.ok) { console.error('Groq HTTP', m, r.status, (await r.text()).slice(0, 300)); continue; }
+      const d = await r.json();
+      return JSON.parse(String(d?.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^```json|```$/g, '').trim());
+    } catch (e) { console.error('Groq failed', m, e && e.message); }
+  }
+  return null;
+}
+// One small step of a website build (plan -> css -> html per page). Each call stays small so it fits Groq's free per-minute token limit.
+async function groqStage(stage, b) {
+  const clip = (v, n) => String(v == null ? '' : v).slice(0, n);
+  const assets = (Array.isArray(b.assets) ? b.assets : []).filter((a) => typeof a === 'string' && /^assets\/[a-z0-9._-]{1,70}$/.test(a)).slice(0, 12);
+  const assetNote = assets.length ? ` The user uploaded images at: ${assets.join(', ')}. Use them exactly as <img src="..."> with good alt text; never redraw them and never add filters, grayscale or overlays to them.` : '';
+  const fileOfSlug = (x) => (x === '/' || x === 'index' ? 'index.html' : String(x).replace(/^\/|\.html$/g, '') + '.html');
+  if (stage === 'plan') {
+    const sys = SYSTEM + '\n' + DESIGN + '\nYou are the art director. Return ONLY one JSON object: {"name":"","description":"","theme":{"primaryColor":"#hex","backgroundColor":"#hex","textColor":"#hex","fontFamily":"a system font stack"},"pages":[{"name":"","slug":"/","sections":[{"title":"","purpose":"","content":"2-3 sentences of real copy"}]}]}. One page unless the request needs more (max 4; the first page has slug "/"). 6 to 8 sections per page, for example hero, key benefits, details or services, proof or testimonials, call to action. Write specific, believable copy for this exact business.';
+    const o = await groqJson(sys, `Website request: ${clip(b.prompt, 1500)}.${assetNote}`, 2200);
+    if (!o || !Array.isArray(o.pages) || !o.pages.length) return null;
+    const pages = o.pages.slice(0, 4).map((p, i) => ({
+      name: clip((p && p.name) || (i ? 'Page ' + (i + 1) : 'Home'), 40),
+      slug: i === 0 ? '/' : clip(String((p && (p.slug || p.name)) || 'page' + i).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page' + i, 30),
+      sections: (Array.isArray(p && p.sections) ? p.sections : []).slice(0, 9).map((x) => ({ title: clip(x && x.title, 80), purpose: clip(x && x.purpose, 120), content: clip(x && x.content, 400) })),
+    }));
+    const t = o.theme || {};
+    return { name: clip(o.name || 'My website', 60), description: clip(o.description, 200), theme: { primaryColor: clip(t.primaryColor || '#4f46e5', 20), backgroundColor: clip(t.backgroundColor || '#0f172a', 20), textColor: clip(t.textColor || '#e2e8f0', 20), fontFamily: clip(t.fontFamily || 'system-ui, sans-serif', 120) }, pages };
+  }
+  const br = b.brief && typeof b.brief === 'object' ? b.brief : null;
+  if (!br || !Array.isArray(br.pages) || !br.pages.length) return null;
+  const brief = { name: clip(br.name, 60), theme: br.theme || {}, pages: br.pages.slice(0, 4) };
+  const briefStr = clip(JSON.stringify(brief), 4500);
+  if (stage === 'css') {
+    const sys = SYSTEM + '\n' + DESIGN + '\nYou are the CSS designer. Return ONLY JSON: {"css":"..."} containing ONE complete, compact stylesheet (about 250-400 lines) for the whole site. Required: :root variables from the theme (--primary, --bg, --text, --muted, --card, --border, --radius, --shadow); a reset; fluid typography with clamp(); .container{width:min(1100px,92%);margin-inline:auto}; sticky .site-header with .nav links and a mobile menu (.nav-toggle button, .nav.open); .hero with a CSS-only gradient background; .btn, .btn-primary, .btn-ghost; .section and .section-alt; .grid with .grid-2 .grid-3 .grid-4; .card with hover lift; .badge; .stats; .testimonial; .cta; forms (.form, label, input, textarea, select) with clear focus rings; .site-footer; small utility classes (.text-center, .mt-2, .mt-4); :focus-visible outlines; a subtle .reveal fade-in; mobile-first media queries at 640px and 900px; prefers-reduced-motion. No @import, no remote url().';
+    const o = await groqJson(sys, 'Design brief: ' + briefStr, 4300);
+    if (!o || typeof o.css !== 'string' || o.css.length < 400) return null;
+    return { css: o.css.replace(/@import[^;]+;/gi, '').replace(/url\(\s*['"]?https?:[^)]*\)/gi, 'none').slice(0, 60000) };
+  }
+  if (stage === 'html') {
+    const pg = b.page && typeof b.page === 'object' ? b.page : null;
+    if (!pg) return null;
+    const classes = (Array.isArray(b.classes) ? b.classes : []).filter((c) => typeof c === 'string' && /^[\w-]{1,40}$/.test(c)).slice(0, 110);
+    const nav = brief.pages.map((p) => `${p.name} -> ${fileOfSlug(p.slug)}`).join(', ');
+    const sys = SYSTEM + '\n' + DESIGN + `\nYou are the front-end developer. Write the BODY INNER HTML for ONE page plus a tiny script. Return ONLY JSON: {"html":"","javascript":""}.\nUse ONLY these CSS classes from the existing stylesheet (write no CSS, no <style> tags): ${classes.join(' ')}.\nStructure: <header class="site-header"> with a brand link and <nav class="nav"> (links: ${nav}; identical on every page) plus <button class="nav-toggle" aria-expanded="false" aria-label="Menu">; then <main> with one <section> per planned section (alternate .section and .section-alt, content inside .container); then <footer class="site-footer">. One h1, an h2 per section, real copy from the plan, forms with labels, simple inline SVG icons allowed. No lorem ipsum, no remote images or scripts.${assetNote}\njavascript: short vanilla JS that toggles .nav.open on .nav-toggle click and updates aria-expanded; nothing heavy.`;
+    const o = await groqJson(sys, `Brand: ${brief.name}. Page to write: ${clip(JSON.stringify(pg), 2500)}`, 4200);
+    if (!o || typeof o.html !== 'string' || o.html.length < 200) return null;
+    return { html: o.html.replace(/<\/?(html|head|body)[^>]*>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').slice(0, 80000), javascript: typeof o.javascript === 'string' ? o.javascript.slice(0, 8000) : '' };
+  }
+  return null;
+}
+
 async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*'); // lets the APK (file/localhost origin) call this API
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -81,7 +154,7 @@ async function handler(req, res) {
   const keys = geminiKeys();
   if (!keys.length && !process.env.GROQ_API_KEY) return res.status(500).json({ error: 'config' });
 
-  const { mode, prompt, site, page, image, assets, backup } = req.body || {};
+  const { mode, prompt, site, page, image, assets, backup, stage } = req.body || {};
   if (!['generate', 'edit'].includes(mode) || typeof prompt !== 'string' || (prompt.trim().length < 3 && !image) || prompt.length > 4000)
     return res.status(400).json({ error: 'input' });
   if (image && (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mime) || typeof image.data !== 'string' || image.data.length > 3_000_000 || !/^[A-Za-z0-9+/=]+$/.test(image.data)))
@@ -94,6 +167,13 @@ async function handler(req, res) {
   const limit = mode === 'generate' ? Number(process.env.GENERATE_LIMIT || 100) : Number(process.env.EDIT_LIMIT || 30), used = hits.get(k) || 0;
   if (used >= limit) return res.status(429).json({ error: 'limit', remaining: 0 });
 
+  if (backup === true && stage && mode === 'generate' && process.env.GROQ_API_KEY) { // staged backup build (see groqStage)
+    if (!['plan', 'css', 'html'].includes(stage)) return res.status(400).json({ error: 'input' });
+    const out = await groqStage(stage, req.body);
+    if (!out) return res.status(503).json({ error: 'busy' });
+    if (stage === 'plan') hits.set(k, used + 1); // one website = one count
+    return res.status(200).json({ ...out, via: 'groq' });
+  }
   const text = mode === 'generate'
     ? `Create a complete multi-page-ready website (at least a Home page; add About/Contact etc. only if useful).\nRequest: ${prompt}` + (assets && assets.length ? `\nThe user uploaded images, available at these exact paths: ${assets.join(', ')}. Use them with <img src="..." alt="..."> where they fit (for example a profile photo, hero or logo). Never redraw, recreate or replace them with illustrations or SVG, and never invent other image files. Show them in their original colors: no grayscale, sepia, blur or brightness filters, no mix-blend-mode, no color overlays or reduced opacity on them.` : '')
     : `Existing site (name, theme, pages):\n${JSON.stringify(site)}\nCurrent page slug: ${page || '/'}\nRequested change: ${prompt}\nReturn ONLY pages that changed or are new (full code for each), plus a short summary of the change. If site.assets lists uploaded images, use them only by their exact path (for example <img src="assets/logo.webp" alt="...">) when the user asks to use their image, and never invent other image files. Show uploaded images in their original colors: do not add grayscale, sepia, blur or brightness filters, blend modes, color overlays or reduced opacity to them. Keep the design system and navigation consistent; if adding a page, also return the other pages with updated navigation.`;
@@ -117,11 +197,11 @@ async function handler(req, res) {
   });
     // Newest Gemini models first (2.5 models now return 404 for new users). Duplicates removed.
     const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.5-flash'].filter(Boolean))];
-    const hasGroq = !!process.env.GROQ_API_KEY, t0 = Date.now(), STOP = 42000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
+    const t0 = Date.now(), STOP = 42000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
     const wait = (ms) => new Promise((x) => setTimeout(x, ms));
     let busyAny = false, sawLimit = false, last = null;
-    for (let round = 0; round < (hasGroq ? 1 : 3); round++) {
-      let busy = false;
+    for (let round = 0; round < 3; round++) {
+      let busy = false, retryAfter = 999;
       for (const [ki, k] of keys.entries()) { // key 1 first, then key 2; Groq is only the very last resort
         for (const m of models) {
           const elapsed = Date.now() - t0;
@@ -145,13 +225,17 @@ async function handler(req, res) {
             continue; // unusable answer: try the next model
           }
           if (r.status === 500 || r.status === 503) busy = busyAny = true;
-          else if (r.status === 429) sawLimit = true;
+          else if (r.status === 429) { // rate limit: Google often says how long to wait (per-minute limits clear quickly)
+            sawLimit = true;
+            try { const jb = await r.json(); const di = (jb.error?.details || []).find((x) => x.retryDelay); const sec = di ? parseFloat(di.retryDelay) : NaN; if (sec > 0) retryAfter = Math.min(retryAfter, sec); } catch (e) {}
+          }
           else { console.error('Gemini HTTP', m, r.status, (await r.text().catch(() => '')).slice(0, 300)); last = { code: 502, body: { error: 'ai', status: r.status } }; }
           if (r.status === 401 || r.status === 403) break; // this key is rejected or blocked: go to the next key
         }
       }
-      if (!busy || Date.now() - t0 > STOP || round === (hasGroq ? 0 : 2)) break;
-      await wait(3000 * (round + 1));
+      const waitMs = busy ? 3000 * (round + 1) : sawLimit && retryAfter <= 25 ? Math.ceil(retryAfter * 1000) + 500 : 0;
+      if (!waitMs || Date.now() - t0 + waitMs > STOP || round === 2) break;
+      await wait(waitMs);
     }
     if (busyAny) return { code: 503, body: { error: 'busy' } };
     if (sawLimit) return { code: 429, body: { error: 'limit' } };
@@ -166,17 +250,7 @@ async function handler(req, res) {
       ? '{"name":"","description":"","theme":{"primaryColor":"","backgroundColor":"","textColor":"","fontFamily":""},"pages":[{"name":"","slug":"","html":"","css":"","javascript":""}]}'
       : '{"summary":"","pages":[{"name":"","slug":"","html":"","css":"","javascript":""}]}';
     const sys = SYSTEM + '\nReturn ONLY one JSON object, no other text, in exactly this shape: ' + shape + '\nKeep the code compact: concise CSS and short JavaScript.';
-    // Pick from Groq's current catalogue (cached 10 min): newest production model first, then the newest preview, then the small one.
-    if (!groqCache.ids || Date.now() - groqCache.t > 600000) {
-      try {
-        const l = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: 'Bearer ' + gk } });
-        if (l.ok) groqCache = { t: Date.now(), ids: ((await l.json()).data || []).map((x) => x.id) };
-      } catch (e) {}
-    }
-    const avail = groqCache.ids;
-    const pref = [process.env.GROQ_MODEL, 'openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'openai/gpt-oss-20b'].filter(Boolean);
-    let list = avail ? pref.filter((m) => avail.includes(m)) : pref;
-    if (avail && list.length < 2) list = [...list, ...avail.filter((m) => !/whisper|guard|tts|compound|embed|orpheus|vision/i.test(m) && !list.includes(m)).slice(0, 2)]; // names changed? use whatever chat models exist
+    const list = await groqModelList(gk);
     for (const m of list) {
       try {
         const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
