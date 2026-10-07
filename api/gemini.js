@@ -1,6 +1,9 @@
 // Vercel serverless route (CommonJS so it works without package.json settings).
 // Env: GEMINI_API_KEY (required), GEMINI_MODEL; optional backups: MISTRAL_API_KEY (+ MISTRAL_MODEL, MISTRAL_MAX_TOKENS) and GROQ_API_KEY (+ GROQ_MODEL, GROQ_MAX_TOKENS)
 let groqCache = { t: 0, ids: null };
+// Remember which Gemini model worked last and pause models that just failed, so a busy model (503) is not retried on every request.
+const modelCool = new Map();
+let goodModel = null;
 // Gemini 3.x: low thinking (faster, leaves room for the JSON); older 2.5 models: thinking off. Temperature left at the default for 3.x.
 const genConfig = (model, schema, lowThink) => ({ responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { temperature: 0.7, thinkingConfig: { thinkingBudget: 0 } } : lowThink ? { thinkingConfig: { thinkingLevel: 'low' } } : {}) });
 // Gemini keys in order of use: GEMINI_API_KEY, then GEMINI_API_KEY_2 (also accepts _2 variants, _BACKUP, or a comma list in GEMINI_API_KEYS)
@@ -236,14 +239,17 @@ async function handler(req, res) {
     }),
   });
     // Newest Gemini models first (2.5 models now return 404 for new users). Duplicates removed.
-    const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.5-flash'].filter(Boolean))];
+    const allModels = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.5-flash'].filter(Boolean))];
     const t0 = Date.now(), STOP = 42000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
     const wait = (ms) => new Promise((x) => setTimeout(x, ms));
     let busyAny = false, sawLimit = false, last = null;
     for (let round = 0; round < 3; round++) {
       let busy = false, retryAfter = 999;
       for (const [ki, k] of keys.entries()) { // key 1 first, then key 2; Groq is only the very last resort
-        for (const m of models) {
+        const live = allModels.filter((m) => !((modelCool.get(ki + '|' + m) || 0) > Date.now())); // skip models that failed in the last 2 minutes
+        let order = live.length ? live : allModels;
+        if (goodModel && order.includes(goodModel)) order = [goodModel, ...order.filter((m) => m !== goodModel)];
+        for (const m of order) {
           const elapsed = Date.now() - t0;
           if (elapsed > STOP) break;
           let r;
@@ -258,12 +264,13 @@ async function handler(req, res) {
             const cand = data?.candidates?.[0];
             const out = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
             if (out) {
-              try { return { parsed: JSON.parse(out.replace(/^```json|```$/g, '').trim()), via: 'gemini' }; }
+              try { const parsed = JSON.parse(out.replace(/^```json|```$/g, '').trim()); goodModel = m; return { parsed, via: 'gemini' }; }
               catch (e) { console.error('JSON parse failed', m, cand?.finishReason, out.slice(-200)); gnotes.push('parse-' + (cand?.finishReason || '')); }
             } else gnotes.push('empty-' + (cand?.finishReason || data?.promptFeedback?.blockReason || 'none'));
             last = { code: 502, body: { error: 'ai', why: 'unusable output' } };
             continue; // unusable answer: try the next model
           }
+          if (r.status === 500 || r.status === 503 || r.status === 429) modelCool.set(ki + '|' + m, Date.now() + 120000);
           if (r.status === 500 || r.status === 503) busy = busyAny = true;
           else if (r.status === 429) { // rate limit: Google often says how long to wait (per-minute limits clear quickly)
             sawLimit = true;
