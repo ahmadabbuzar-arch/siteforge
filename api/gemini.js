@@ -1,7 +1,24 @@
 // Vercel serverless route (CommonJS so it works without package.json settings).
-// Env: GEMINI_API_KEY (required), GEMINI_MODEL; optional backups: MISTRAL_API_KEY (+ MISTRAL_MODEL, MISTRAL_MAX_TOKENS) and GROQ_API_KEY (+ GROQ_MODEL, GROQ_MAX_TOKENS)
+// Env: GEMINI_API_KEY (required), GEMINI_MODEL; optional backups (see PROVIDERS): GROQ_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY, XKIRO_API_KEY, REQUESTY_API_KEY (+ REQUESTY_MODEL)
 let groqCache = { t: 0, ids: null };
 // Remember which Gemini model worked last and pause models that just failed, so a busy model (503) is not retried on every request.
+let geminiCache = { t: 0, ids: null };
+// Newest Gemini flash models from the live catalogue (full flash first, then the lighter "lite" ones, which often still work when flash is overloaded).
+async function geminiModelList(k) {
+  if (!geminiCache.ids || Date.now() - geminiCache.t > 600000) {
+    try {
+      const l = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': k }, signal: AbortSignal.timeout(6000) });
+      if (l.ok) geminiCache = { t: Date.now(), ids: ((await l.json()).models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent')).map((m) => String(m.name).replace('models/', '')) };
+    } catch (e) {}
+  }
+  const parse = (id) => { const m = id.match(/^gemini-(\d+(?:\.\d+)?)-flash(-lite)?$/); return m ? { id, v: parseFloat(m[1]), lite: !!m[2] } : null; };
+  const found = (geminiCache.ids || []).map(parse).filter(Boolean);
+  const byNew = (a, b) => b.v - a.v;
+  const full = found.filter((x) => !x.lite).sort(byNew).slice(0, 4).map((x) => x.id);
+  const lite = found.filter((x) => x.lite).sort(byNew).slice(0, 2).map((x) => x.id);
+  const list = found.length ? [...full, 'gemini-flash-latest', ...lite, 'gemini-flash-lite-latest'] : ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-flash-lite-latest'];
+  return [...new Set([process.env.GEMINI_MODEL, ...list].filter(Boolean))];
+}
 const modelCool = new Map();
 let goodModel = null;
 // Gemini 3.x: low thinking (faster, leaves room for the JSON); older 2.5 models: thinking off. Temperature left at the default for 3.x.
@@ -22,10 +39,29 @@ const SCHEMA = {
 
 const config = { maxDuration: 60 }; // full-site generation takes >10s (Vercel default)
 
-// ---------- Backup AIs: Groq (fast) and Mistral (strong coder) working together ----------
+// ---------- Backup AIs: several providers working together ----------
 const DESIGN = 'Design rules: modern premium look, generous whitespace, 8px spacing scale, fluid type with clamp(), one primary accent colour from the theme used sparingly, soft borders, subtle shadows, rounded cards, clear visual hierarchy, a strong hero, consistent buttons, hover and focus states, smooth subtle transitions, mobile-first with breakpoints, no horizontal overflow, readable contrast, no lorem ipsum, no external fonts or images.';
 let mistralCache = { t: 0, ids: null };
-const haveBackup = () => !!(process.env.GROQ_API_KEY || process.env.MISTRAL_API_KEY);
+const catCache = {};
+// All of these speak the OpenAI chat format. Key names accepted in Vercel: see "keys". Optional: <NAME>_MODEL (comma list ok), <NAME>_MAX_TOKENS.
+const PROVIDERS = {
+  groq: { url: 'https://api.groq.com/openai/v1', keys: ['GROQ_API_KEY'], model: 'GROQ_MODEL', timeout: 25000 },
+  mistral: { url: 'https://api.mistral.ai/v1', keys: ['MISTRAL_API_KEY'], model: 'MISTRAL_MODEL', timeout: 38000 },
+  openrouter: { url: 'https://openrouter.ai/api/v1', keys: ['OPENROUTER_API_KEY', 'OPENROUTER_KEY'], model: 'OPENROUTER_MODEL', timeout: 38000 }, // $0 models only unless you set OPENROUTER_MODEL
+  xkiro: { url: process.env.XKIRO_BASE_URL || 'https://api.xkiro.com/v1', keys: ['XKIRO_API_KEY', 'XKIRO_KEY'], model: 'XKIRO_MODEL', timeout: 38000 }, // free-looking models only unless you set XKIRO_MODEL
+  requesty: { url: process.env.REQUESTY_BASE_URL || 'https://router.requesty.ai/v1', keys: ['REQUESTY_API_KEY', 'REQUESTY_KEY'], model: 'REQUESTY_MODEL', timeout: 38000 }, // free plan: $0 models only, 200 requests/day shared (set REQUESTY_MODEL to use a paid one)
+};
+const provKey = (p) => PROVIDERS[p].keys.map((n) => process.env[n]).find(Boolean);
+const activeProviders = () => Object.keys(PROVIDERS).filter(provKey);
+const haveBackup = () => activeProviders().length > 0;
+// Who does what, strongest first. Pages rotate through this list so different AIs write different pages of the same site.
+const ORDER = {
+  plan: ['groq', 'mistral', 'openrouter', 'xkiro', 'requesty'],
+  css: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
+  html: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
+  polish: ['openrouter', 'requesty', 'mistral', 'xkiro', 'groq'],
+  oneshot: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
+};
 async function groqModelList(gk) { // newest production model first, then newest preview, then the small one (checked against Groq's live catalogue, cached 10 min)
   if (!groqCache.ids || Date.now() - groqCache.t > 600000) {
     try {
@@ -51,35 +87,64 @@ async function mistralModelList(mk) { // strongest first; the *-latest names are
   const list = avail ? pref.filter((m) => avail.includes(m)) : pref;
   return list.length ? list : pref;
 }
-async function oneProvider(prov, sys, user, maxTokens, deadline) {
-  const key = prov === 'groq' ? process.env.GROQ_API_KEY : process.env.MISTRAL_API_KEY;
-  if (!key) return null;
-  const url = prov === 'groq' ? 'https://api.groq.com/openai/v1/chat/completions' : 'https://api.mistral.ai/v1/chat/completions';
-  // Groq's free plan has a small per-minute token budget; Mistral has much more room, so it may write longer output.
-  const cap = prov === 'groq' ? Math.min(maxTokens, Number(process.env.GROQ_MAX_TOKENS || 6000)) : Math.min(Math.round(maxTokens * 1.6), Number(process.env.MISTRAL_MAX_TOKENS || 12000));
-  for (const m of prov === 'groq' ? await groqModelList(key) : await mistralModelList(key)) {
-    const left = (deadline || Infinity) - Date.now();
-    if (left < 4000) return null; // out of time (Vercel stops the function at 60s)
+
+const RANK = [/qwen.*coder/i, /deepseek/i, /gpt-oss-120b/i, /glm/i, /kimi/i, /nemotron-3-(ultra|super)/i, /mistral|mixtral/i, /llama.*70b/i, /qwen/i, /gemma/i, /gpt-oss/i];
+const NOT_CHAT = /embed|tts|whisper|vision|image|ocr|moderation|guard|safety|audio|leanstral|prover|\bvl\b/i; // not useful for writing websites
+const REQUESTY_FREE = ['nvidia/nemotron-3-super-120b-a12b', 'nvidia/nemotron-3-ultra-550b-a55b']; // ids Requesty documents as $0 (used only if its catalogue has no price info)
+const priceOf = (e) => { const v = [e.pricing && e.pricing.prompt, e.pricing && e.pricing.completion, e.pricing && e.pricing.input, e.pricing && e.pricing.output, e.input_price, e.output_price, e.prompt_price, e.completion_price].filter((x) => x !== undefined && x !== null && x !== ''); return v.length ? v.map(Number) : null; };
+const looksFree = (e) => /free/i.test(e.id) || (() => { const v = priceOf(e); return !!v && v.every((n) => n === 0); })();
+async function modelList(p) {
+  const explicit = String(process.env[PROVIDERS[p].model] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const key = provKey(p);
+  if (p === 'groq') return [...new Set([...explicit, ...(await groqModelList(key))])];
+  if (p === 'mistral') return [...new Set([...explicit, ...(await mistralModelList(key))])];
+  // OpenRouter / Xkiro / Requesty: read their live catalogue and use only models priced at $0 (best coders first). Set <NAME>_MODEL to choose another one yourself.
+  if (!catCache[p] || Date.now() - catCache[p].t > 600000) {
     try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-        signal: AbortSignal.timeout(Math.min(prov === 'mistral' ? 38000 : 25000, left)),
-        body: JSON.stringify({ model: m, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }], temperature: 0.6, max_tokens: cap, response_format: { type: 'json_object' } }),
-      });
-      if (!r.ok) { console.error(prov, 'HTTP', m, r.status, (await r.text()).slice(0, 300)); continue; } // try the next model
-      const d = await r.json();
-      return JSON.parse(String(d?.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^```json|```$/g, '').trim());
-    } catch (e) { console.error(prov, 'failed', m, e && e.message); }
+      const l = await fetch(PROVIDERS[p].url + '/models', { headers: { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(7000) });
+      if (l.ok) catCache[p] = { t: Date.now(), data: (await l.json()).data || [] };
+    } catch (e) {}
+  }
+  const data = ((catCache[p] && catCache[p].data) || []).filter((e) => e && typeof e.id === 'string' && !NOT_CHAT.test(e.id));
+  let free = data.filter((e) => looksFree(e) && (!e.context_length || e.context_length >= 32000));
+  if (p === 'requesty' && !free.length && !data.some(priceOf)) free = data.length ? data.filter((e) => REQUESTY_FREE.includes(e.id)) : REQUESTY_FREE.map((id) => ({ id }));
+  const rank = (id) => { const k = RANK.findIndex((rx) => rx.test(id)); return k < 0 ? 99 : k; };
+  return [...new Set([...explicit, ...free.sort((a, b) => rank(a.id) - rank(b.id)).slice(0, 3).map((e) => e.id)])];
+}
+async function oneProvider(p, sys, user, maxTokens, deadline) {
+  const cfg = PROVIDERS[p], key = provKey(p);
+  if (!key) return null;
+  // Groq's free plan has a small per-minute token budget; the others have more room, so they may write longer output.
+  const cap = p === 'groq' ? Math.min(maxTokens, Number(process.env.GROQ_MAX_TOKENS || 6000)) : Math.min(Math.round(maxTokens * (p === 'mistral' ? 1.6 : 1.4)), Number(process.env[p.toUpperCase() + '_MAX_TOKENS'] || (p === 'mistral' ? 12000 : 10000)));
+  const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key, ...(p === 'openrouter' ? { 'HTTP-Referer': 'https://sitepilotog.vercel.app', 'X-Title': 'SitePilot' } : {}) };
+  for (const m of await modelList(p)) {
+    for (const jsonMode of [true, false]) { // some models reject JSON mode: then ask again without it
+      const left = (deadline || Infinity) - Date.now();
+      if (left < 4000) return null; // out of time (Vercel stops the function at 60s)
+      try {
+        const r = await fetch(cfg.url + '/chat/completions', {
+          method: 'POST', headers, signal: AbortSignal.timeout(Math.min(cfg.timeout, left)),
+          body: JSON.stringify({ model: m, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }], temperature: 0.6, max_tokens: cap, ...(jsonMode ? { response_format: { type: 'json_object' } } : {}) }),
+        });
+        if (!r.ok) { console.error(p, 'HTTP', m, r.status, (await r.text()).slice(0, 300)); if (r.status === 400 && jsonMode) continue; break; }
+        const d = await r.json();
+        const t = String(d?.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^```json|```$/g, '').trim();
+        const a = t.indexOf('{'), z = t.lastIndexOf('}');
+        return JSON.parse(a >= 0 && z > a ? t.slice(a, z + 1) : t);
+      } catch (e) { console.error(p, 'failed', m, e && e.message); break; }
+    }
   }
   return null;
 }
-// Asks the preferred AI first and the other one if it fails, so either can cover for the other.
+// Asks the best AI for this job first and the others if it fails, so any of them can cover for another.
 async function aiJson(sys, user, maxTokens, opt = {}) {
-  const first = opt.prefer === 'groq' ? 'groq' : 'mistral';
-  for (const prov of [first, first === 'groq' ? 'mistral' : 'groq']) {
-    const data = await oneProvider(prov, sys, user, maxTokens, opt.deadline);
-    if (data) return { data, by: prov };
+  let order = (ORDER[opt.stage] || ORDER.oneshot).filter(provKey);
+  if (opt.prefer && order.includes(opt.prefer)) order = [opt.prefer, ...order.filter((p) => p !== opt.prefer)];
+  if (opt.slot && order.length) { const k = opt.slot % order.length; order = [...order.slice(k), ...order.slice(0, k)]; } // page 2 starts with the next AI
+  if (opt.avoid) order = [...order.filter((p) => p !== opt.avoid), ...order.filter((p) => p === opt.avoid)];
+  for (const p of order) {
+    const data = await oneProvider(p, sys, user, maxTokens, opt.deadline);
+    if (data) return { data, by: p };
   }
   return null;
 }
@@ -91,7 +156,7 @@ async function backupStage(stage, b, opt) {
   const fileOfSlug = (x) => (x === '/' || x === 'index' ? 'index.html' : String(x).replace(/^\/|\.html$/g, '') + '.html');
   if (stage === 'plan') {
     const sys = SYSTEM + '\n' + DESIGN + '\nYou are the art director. Return ONLY one JSON object: {"name":"","description":"","theme":{"primaryColor":"#hex","backgroundColor":"#hex","textColor":"#hex","fontFamily":"a system font stack"},"pages":[{"name":"","slug":"/","sections":[{"title":"","purpose":"","content":"2-3 sentences of real copy"}]}]}. One page unless the request needs more (max 4; the first page has slug "/"). 6 to 8 sections per page, for example hero, key benefits, details or services, proof or testimonials, call to action. Write specific, believable copy for this exact business.';
-    const g = await aiJson(sys, `Website request: ${clip(b.prompt, 1500)}.${assetNote}`, 2200, opt);
+    const g = await aiJson(sys, `Website request: ${clip(b.prompt, 1500)}.${assetNote}`, 2200, { ...opt, stage: 'plan' });
     const o = g && g.data;
     if (!o || !Array.isArray(o.pages) || !o.pages.length) return null;
     const pages = o.pages.slice(0, 4).map((p, i) => ({
@@ -108,7 +173,7 @@ async function backupStage(stage, b, opt) {
   const briefStr = clip(JSON.stringify(brief), 4500);
   if (stage === 'css') {
     const sys = SYSTEM + '\n' + DESIGN + '\nYou are the CSS designer. Return ONLY JSON: {"css":"..."} containing ONE complete, compact stylesheet (about 250-400 lines) for the whole site. Required: :root variables from the theme (--primary, --bg, --text, --muted, --card, --border, --radius, --shadow); a reset; fluid typography with clamp(); .container{width:min(1100px,92%);margin-inline:auto}; sticky .site-header with .nav links and a mobile menu (.nav-toggle button, .nav.open); .hero with a CSS-only gradient background; .btn, .btn-primary, .btn-ghost; .section and .section-alt; .grid with .grid-2 .grid-3 .grid-4; .card with hover lift; .badge; .stats; .testimonial; .cta; forms (.form, label, input, textarea, select) with clear focus rings; .site-footer; small utility classes (.text-center, .mt-2, .mt-4); :focus-visible outlines; a subtle .reveal fade-in; mobile-first media queries at 640px and 900px; prefers-reduced-motion. No @import, no remote url().';
-    const g = await aiJson(sys, 'Design brief: ' + briefStr, 4300, opt);
+    const g = await aiJson(sys, 'Design brief: ' + briefStr, 4300, { ...opt, stage: 'css' });
     const o = g && g.data;
     if (!o || typeof o.css !== 'string' || o.css.length < 400) return null;
     return { css: o.css.replace(/@import[^;]+;/gi, '').replace(/url\(\s*['"]?https?:[^)]*\)/gi, 'none').slice(0, 60000), by: g.by };
@@ -119,10 +184,18 @@ async function backupStage(stage, b, opt) {
     const classes = (Array.isArray(b.classes) ? b.classes : []).filter((c) => typeof c === 'string' && /^[\w-]{1,40}$/.test(c)).slice(0, 110);
     const nav = brief.pages.map((p) => `${p.name} -> ${fileOfSlug(p.slug)}`).join(', ');
     const sys = SYSTEM + '\n' + DESIGN + `\nYou are the front-end developer. Write the BODY INNER HTML for ONE page plus a tiny script. Return ONLY JSON: {"html":"","javascript":""}.\nUse ONLY these CSS classes from the existing stylesheet (write no CSS, no <style> tags): ${classes.join(' ')}.\nStructure: <header class="site-header"> with a brand link and <nav class="nav"> (links: ${nav}; identical on every page) plus <button class="nav-toggle" aria-expanded="false" aria-label="Menu">; then <main> with one <section> per planned section (alternate .section and .section-alt, content inside .container); then <footer class="site-footer">. One h1, an h2 per section, real copy from the plan, forms with labels, simple inline SVG icons allowed. No lorem ipsum, no remote images or scripts.${assetNote}\njavascript: short vanilla JS that toggles .nav.open on .nav-toggle click and updates aria-expanded; nothing heavy.`;
-    const g = await aiJson(sys, `Brand: ${brief.name}. Page to write: ${clip(JSON.stringify(pg), 2500)}`, 4200, opt);
+    const g = await aiJson(sys, `Brand: ${brief.name}. Page to write: ${clip(JSON.stringify(pg), 2500)}`, 4200, { ...opt, stage: 'html' });
     const o = g && g.data;
     if (!o || typeof o.html !== 'string' || o.html.length < 200) return null;
     return { html: o.html.replace(/<\/?(html|head|body)[^>]*>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').slice(0, 80000), javascript: typeof o.javascript === 'string' ? o.javascript.slice(0, 8000) : '', by: g.by };
+  }
+  if (stage === 'polish') { // a second designer adds finishing touches on top of the base stylesheet
+    const classes = (Array.isArray(b.classes) ? b.classes : []).filter((c) => typeof c === 'string' && /^[\w-]{1,40}$/.test(c)).slice(0, 110);
+    const sys = SYSTEM + '\n' + DESIGN + `\nYou are the senior visual designer reviewing a finished stylesheet. Return ONLY JSON: {"css":"..."} with an ADDITIONAL stylesheet (60-120 lines) that is loaded after the base one and adds finishing touches using ONLY these existing classes: ${classes.join(' ')}. Ideas: a richer hero background (layered CSS gradients, subtle grid or noise made from gradients), card depth and hover states, button press and focus states, refined section dividers and spacing rhythm, balanced headings (text-wrap: balance), ::selection colour, smooth scrolling, nicer form inputs, rounded images with object-fit, subtle reveal animations. Do not change layout widths, do not hide content. No @import, no remote url().`;
+    const g = await aiJson(sys, 'Design brief: ' + briefStr, 2500, { ...opt, stage: 'polish' });
+    const o = g && g.data;
+    if (!o || typeof o.css !== 'string' || o.css.length < 150) return null;
+    return { css: o.css.replace(/@import[^;]+;/gi, '').replace(/url\(\s*['"]?https?:[^)]*\)/gi, 'none').slice(0, 20000), by: g.by };
   }
   return null;
 }
@@ -138,6 +211,21 @@ async function handler(req, res) {
       const d = await l.json();
       return res.status(200).json({ status: l.status, models: (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name), error: d.error && d.error.message });
     } catch (e) { return res.status(500).json({ error: 'list' }); }
+  }
+  if (req.method === 'GET' && req.query && req.query.providers) { // diagnostic: which backup AIs are connected and which model each will use (one tiny request each)
+    const ipp = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim(), pk = 'prov' + ipp + new Date().toISOString().slice(0, 10), pu = hits.get(pk) || 0;
+    if (pu >= 10) return res.status(429).json({ error: 'limit' });
+    hits.set(pk, pu + 1);
+    const out = [];
+    for (const p of activeProviders()) {
+      const models = await modelList(p);
+      if (!models.length) { out.push({ provider: p, model: null, note: 'no free model found, set ' + PROVIDERS[p].model }); continue; }
+      try {
+        const t = await fetch(PROVIDERS[p].url + '/chat/completions', { method: 'POST', signal: AbortSignal.timeout(20000), headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + provKey(p), ...(p === 'openrouter' ? { 'HTTP-Referer': 'https://sitepilotog.vercel.app', 'X-Title': 'SitePilot' } : {}) }, body: JSON.stringify({ model: models[0], messages: [{ role: 'user', content: 'Reply with the word ok' }], max_tokens: 8 }) });
+        out.push({ provider: p, model: models[0], status: t.status, msg: t.ok ? '' : (await t.text()).slice(0, 140) });
+      } catch (e) { out.push({ provider: p, model: models[0], status: 'failed or timed out' }); }
+    }
+    return res.status(200).json({ providers: out });
   }
   if (req.method === 'GET' && req.query && req.query.mistral) { // diagnostic: which Mistral models can this key use?
     try {
@@ -190,9 +278,9 @@ async function handler(req, res) {
       }
       out.push({ key: ki + 1, results });
     }
-    return res.status(200).json({ groq: !!process.env.GROQ_API_KEY, mistral: !!process.env.MISTRAL_API_KEY, keys: out });
+    return res.status(200).json({ backups: activeProviders(), keys: out });
   }
-  if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: geminiKeys().length > 0, geminiKeys: geminiKeys().length, groq: !!process.env.GROQ_API_KEY, mistral: !!process.env.MISTRAL_API_KEY });
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method', keySet: geminiKeys().length > 0, geminiKeys: geminiKeys().length, backups: activeProviders() });
   const keys = geminiKeys();
   if (!keys.length && !haveBackup()) return res.status(500).json({ error: 'config' });
 
@@ -210,9 +298,9 @@ async function handler(req, res) {
   if (used >= limit) return res.status(429).json({ error: 'limit', remaining: 0 });
 
   if (backup === true && stage && mode === 'generate' && haveBackup()) { // staged backup build (see backupStage)
-    if (!['plan', 'css', 'html'].includes(stage)) return res.status(400).json({ error: 'input' });
-    const prefer = req.body.prefer === 'groq' || req.body.prefer === 'mistral' ? req.body.prefer : undefined;
-    const out = await backupStage(stage, req.body, { prefer, deadline: Date.now() + 52000 });
+    if (!['plan', 'css', 'html', 'polish'].includes(stage)) return res.status(400).json({ error: 'input' });
+    const nm = (v) => (typeof v === 'string' && PROVIDERS[v] ? v : undefined);
+    const out = await backupStage(stage, req.body, { prefer: nm(req.body.prefer), avoid: nm(req.body.avoid), slot: Number.isInteger(req.body.slot) && req.body.slot > 0 && req.body.slot < 10 ? req.body.slot : 0, deadline: Date.now() + 52000 });
     if (!out) return res.status(503).json({ error: 'busy' });
     if (stage === 'plan') hits.set(k, used + 1); // one website = one count
     return res.status(200).json({ ...out, via: out.by || 'backup' });
@@ -239,7 +327,7 @@ async function handler(req, res) {
     }),
   });
     // Newest Gemini models first (2.5 models now return 404 for new users). Duplicates removed.
-    const allModels = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.5-flash'].filter(Boolean))];
+    const allModels = await geminiModelList(keys[0]);
     const t0 = Date.now(), STOP = 42000; // stop starting new Gemini calls after STOP ms (Vercel limit is 60s)
     const wait = (ms) => new Promise((x) => setTimeout(x, ms));
     let busyAny = false, sawLimit = false, last = null;
@@ -296,7 +384,7 @@ async function handler(req, res) {
       ? '{"name":"","description":"","theme":{"primaryColor":"","backgroundColor":"","textColor":"","fontFamily":""},"pages":[{"name":"","slug":"","html":"","css":"","javascript":""}]}'
       : '{"summary":"","pages":[{"name":"","slug":"","html":"","css":"","javascript":""}]}';
     const sys = SYSTEM + '\n' + DESIGN + '\nReturn ONLY one JSON object, no other text, in exactly this shape: ' + shape + '\nKeep the code compact: concise CSS and short JavaScript.';
-    const got = await aiJson(sys, text, 7000, { prefer: 'mistral', deadline: Date.now() + 52000 });
+    const got = await aiJson(sys, text, 7000, { stage: 'oneshot', deadline: Date.now() + 52000 });
     const parsed = got && got.data;
     if (!parsed || !Array.isArray(parsed.pages) || !parsed.pages.length) return null;
     const pages = parsed.pages.map((p) => ({ name: String(p.name || 'Home'), slug: String(p.slug || '/'), html: String(p.html || ''), css: String(p.css || ''), javascript: String(p.javascript || '') }));
