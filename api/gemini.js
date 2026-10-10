@@ -25,6 +25,7 @@ let goodModel = null;
 const genConfig = (model, schema, lowThink) => ({ responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: 32000, ...(/2\.5/.test(model) ? { temperature: 0.7, thinkingConfig: { thinkingBudget: 0 } } : lowThink ? { thinkingConfig: { thinkingLevel: 'low' } } : {}) });
 // Gemini keys in order of use: GEMINI_API_KEY, then GEMINI_API_KEY_2 (also accepts _2 variants, _BACKUP, or a comma list in GEMINI_API_KEYS)
 const geminiKeys = () => [...new Set(['GEMINI_API_KEY', 'GEMINI_API_KEY_2', 'GEMINI_API_KEY2', 'GEMINI_API_KEY_BACKUP', 'GEMINI_API_KEY_B'].map((n) => process.env[n]).concat((process.env.GEMINI_API_KEYS || '').split(',')).map((x) => (x || '').trim()).filter(Boolean))];
+const kit = require('./_kit.js');
 const hits = new Map(); // in-memory per-IP counter (resets on cold start); use Upstash/Firebase for strict limits
 // Env: GENERATE_LIMIT = abuse backstop per IP per day (default 100; the per-user limit of 5 is in index.html), EDIT_LIMIT = AI edits per IP per day (default 30)
 
@@ -59,6 +60,7 @@ const ORDER = {
   plan: ['groq', 'mistral', 'openrouter', 'xkiro', 'requesty'],
   css: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
   html: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
+  page: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
   polish: ['openrouter', 'requesty', 'mistral', 'xkiro', 'groq'],
   oneshot: ['mistral', 'openrouter', 'requesty', 'xkiro', 'groq'],
 };
@@ -148,56 +150,71 @@ async function aiJson(sys, user, maxTokens, opt = {}) {
   }
   return null;
 }
-// One small step of a website build (plan -> css -> html per page). Groq plans (fast), Mistral designs and codes, pages can be split between both.
+// Two steps build a site with the SitePilot Kit (api/_kit.js): the AIs write the PLAN and the CONTENT; the kit supplies the polished design.
+// plan (one AI) -> page content for every page (different AIs in parallel) -> the kit renders HTML and CSS.
 async function backupStage(stage, b, opt) {
-  const clip = (v, n) => String(v == null ? '' : v).slice(0, n);
+  const clip = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n);
   const assets = (Array.isArray(b.assets) ? b.assets : []).filter((a) => typeof a === 'string' && /^assets\/[a-z0-9._-]{1,70}$/.test(a)).slice(0, 12);
-  const assetNote = assets.length ? ` The user uploaded images at: ${assets.join(', ')}. Use them exactly as <img src="..."> with good alt text; never redraw them and never add filters, grayscale or overlays to them.` : '';
-  const fileOfSlug = (x) => (x === '/' || x === 'index' ? 'index.html' : String(x).replace(/^\/|\.html$/g, '') + '.html');
   if (stage === 'plan') {
-    const sys = SYSTEM + '\n' + DESIGN + '\nYou are the art director. Return ONLY one JSON object: {"name":"","description":"","theme":{"primaryColor":"#hex","backgroundColor":"#hex","textColor":"#hex","fontFamily":"a system font stack"},"pages":[{"name":"","slug":"/","sections":[{"title":"","purpose":"","content":"2-3 sentences of real copy"}]}]}. One page unless the request needs more (max 4; the first page has slug "/"). 6 to 8 sections per page, for example hero, key benefits, details or services, proof or testimonials, call to action. Write specific, believable copy for this exact business.';
-    const g = await aiJson(sys, `Website request: ${clip(b.prompt, 1500)}.${assetNote}`, 2200, { ...opt, stage: 'plan' });
-    const o = g && g.data;
-    if (!o || !Array.isArray(o.pages) || !o.pages.length) return null;
-    const pages = o.pages.slice(0, 4).map((p, i) => ({
-      name: clip((p && p.name) || (i ? 'Page ' + (i + 1) : 'Home'), 40),
-      slug: i === 0 ? '/' : clip(String((p && (p.slug || p.name)) || 'page' + i).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page' + i, 30),
-      sections: (Array.isArray(p && p.sections) ? p.sections : []).slice(0, 9).map((x) => ({ title: clip(x && x.title, 80), purpose: clip(x && x.purpose, 120), content: clip(x && x.content, 400) })),
-    }));
-    const t = o.theme || {};
-    return { name: clip(o.name || 'My website', 60), description: clip(o.description, 200), theme: { primaryColor: clip(t.primaryColor || '#4f46e5', 20), backgroundColor: clip(t.backgroundColor || '#0f172a', 20), textColor: clip(t.textColor || '#e2e8f0', 20), fontFamily: clip(t.fontFamily || 'system-ui, sans-serif', 120) }, pages, by: g.by };
+    const short = kit.shortlist(String(b.prompt || ''));
+    const sys = 'You are a senior creative director and information architect at a top web agency. Plan a premium website for the request. Return ONLY one JSON object: {"name":"","tagline":"max 8 words","description":"1 sentence","preset":"id","brandColor":"#hex or empty","contactEmail":"only if the user wrote one, else empty","tone":"2-4 words","navCta":{"label":"max 3 words","target":"contact"},"pages":[{"name":"Home","slug":"/","sections":[{"type":"hero","label":"Home"}]}]}.\n'
+      + `preset: choose exactly one of these looks: ${kit.presetMenu(short)}. Pick the best fit for this business.\n`
+      + `Pages: one page for simple businesses; up to 4 pages only when the request clearly needs them (for example About, Services, Contact). Every page has 4 to 8 sections. Section types: ${kit.TYPES.join(', ')}. Home starts with a hero (hero only once, only on Home). Choose sections that suit THIS business and vary the order; do not repeat one fixed sequence. Exactly one page holds a contact section. End Home with cta unless Home holds the contact section. label = the menu text, max 14 characters. Use the business name the user gave, or invent a short brand name. brandColor only if the user named a colour, else "".`
+      + (assets.length ? ' The visitor uploaded their own photos; the site places them automatically (hero and sections).' : '');
+    const g = await aiJson(sys, `Website request: ${clip(b.prompt, 1500)}`, 1700, { ...opt, stage: 'plan' });
+    if (!g || !g.data || typeof g.data !== 'object') return null;
+    const plan = kit.normalizePlan(g.data, String(b.prompt || ''));
+    return { ...plan, theme: kit.themeSummary(plan), css: kit.kitCss(plan), by: g.by };
   }
-  const br = b.brief && typeof b.brief === 'object' ? b.brief : null;
-  if (!br || !Array.isArray(br.pages) || !br.pages.length) return null;
-  const brief = { name: clip(br.name, 60), theme: br.theme || {}, pages: br.pages.slice(0, 4) };
-  const briefStr = clip(JSON.stringify(brief), 4500);
-  if (stage === 'css') {
-    const sys = SYSTEM + '\n' + DESIGN + '\nYou are the CSS designer. Return ONLY JSON: {"css":"..."} containing ONE complete, compact stylesheet (about 250-400 lines) for the whole site. Required: :root variables from the theme (--primary, --bg, --text, --muted, --card, --border, --radius, --shadow); a reset; fluid typography with clamp(); .container{width:min(1100px,92%);margin-inline:auto}; sticky .site-header with .nav links and a mobile menu (.nav-toggle button, .nav.open); .hero with a CSS-only gradient background; .btn, .btn-primary, .btn-ghost; .section and .section-alt; .grid with .grid-2 .grid-3 .grid-4; .card with hover lift; .badge; .stats; .testimonial; .cta; forms (.form, label, input, textarea, select) with clear focus rings; .site-footer; small utility classes (.text-center, .mt-2, .mt-4); :focus-visible outlines; a subtle .reveal fade-in; mobile-first media queries at 640px and 900px; prefers-reduced-motion. No @import, no remote url().';
-    const g = await aiJson(sys, 'Design brief: ' + briefStr, 4300, { ...opt, stage: 'css' });
-    const o = g && g.data;
-    if (!o || typeof o.css !== 'string' || o.css.length < 400) return null;
-    return { css: o.css.replace(/@import[^;]+;/gi, '').replace(/url\(\s*['"]?https?:[^)]*\)/gi, 'none').slice(0, 60000), by: g.by };
-  }
-  if (stage === 'html') {
-    const pg = b.page && typeof b.page === 'object' ? b.page : null;
-    if (!pg) return null;
-    const classes = (Array.isArray(b.classes) ? b.classes : []).filter((c) => typeof c === 'string' && /^[\w-]{1,40}$/.test(c)).slice(0, 110);
-    const nav = brief.pages.map((p) => `${p.name} -> ${fileOfSlug(p.slug)}`).join(', ');
-    const sys = SYSTEM + '\n' + DESIGN + `\nYou are the front-end developer. Write the BODY INNER HTML for ONE page plus a tiny script. Return ONLY JSON: {"html":"","javascript":""}.\nUse ONLY these CSS classes from the existing stylesheet (write no CSS, no <style> tags): ${classes.join(' ')}.\nStructure: <header class="site-header"> with a brand link and <nav class="nav"> (links: ${nav}; identical on every page) plus <button class="nav-toggle" aria-expanded="false" aria-label="Menu">; then <main> with one <section> per planned section (alternate .section and .section-alt, content inside .container); then <footer class="site-footer">. One h1, an h2 per section, real copy from the plan, forms with labels, simple inline SVG icons allowed. No lorem ipsum, no remote images or scripts.${assetNote}\njavascript: short vanilla JS that toggles .nav.open on .nav-toggle click and updates aria-expanded; nothing heavy.`;
-    const g = await aiJson(sys, `Brand: ${brief.name}. Page to write: ${clip(JSON.stringify(pg), 2500)}`, 4200, { ...opt, stage: 'html' });
-    const o = g && g.data;
-    if (!o || typeof o.html !== 'string' || o.html.length < 200) return null;
-    return { html: o.html.replace(/<\/?(html|head|body)[^>]*>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').slice(0, 80000), javascript: typeof o.javascript === 'string' ? o.javascript.slice(0, 8000) : '', by: g.by };
-  }
-  if (stage === 'polish') { // a second designer adds finishing touches on top of the base stylesheet
-    const classes = (Array.isArray(b.classes) ? b.classes : []).filter((c) => typeof c === 'string' && /^[\w-]{1,40}$/.test(c)).slice(0, 110);
-    const sys = SYSTEM + '\n' + DESIGN + `\nYou are the senior visual designer reviewing a finished stylesheet. Return ONLY JSON: {"css":"..."} with an ADDITIONAL stylesheet (60-120 lines) that is loaded after the base one and adds finishing touches using ONLY these existing classes: ${classes.join(' ')}. Ideas: a richer hero background (layered CSS gradients, subtle grid or noise made from gradients), card depth and hover states, button press and focus states, refined section dividers and spacing rhythm, balanced headings (text-wrap: balance), ::selection colour, smooth scrolling, nicer form inputs, rounded images with object-fit, subtle reveal animations. Do not change layout widths, do not hide content. No @import, no remote url().`;
-    const g = await aiJson(sys, 'Design brief: ' + briefStr, 2500, { ...opt, stage: 'polish' });
-    const o = g && g.data;
-    if (!o || typeof o.css !== 'string' || o.css.length < 150) return null;
-    return { css: o.css.replace(/@import[^;]+;/gi, '').replace(/url\(\s*['"]?https?:[^)]*\)/gi, 'none').slice(0, 20000), by: g.by };
+  if (stage === 'page') {
+    if (!b.brief || typeof b.brief !== 'object') return null;
+    const plan = kit.normalizePlan(b.brief, '');
+    const idx = Number.isInteger(b.pageIndex) ? b.pageIndex : -1;
+    if (idx < 0 || idx >= plan.pages.length) return null;
+    const page = plan.pages[idx], types = [...new Set(page.sections.map((x) => x.type))];
+    const sys = 'You are a senior conversion copywriter. Write the content for ONE page of a website. Return ONLY JSON: {"sections":[...]} containing exactly these sections in this order: ' + page.sections.map((x) => `${x.type} ("${x.label}")`).join(', ') + '.\n'
+      + 'Shape of each section:\n' + types.map((t) => kit.DOCS[t]).join('\n') + '\n'
+      + 'Rules: specific, persuasive, benefit-led copy for this exact business; short sentences; no lorem ipsum; never invent phone numbers, emails, street addresses, awards or claims about real companies; testimonials are generic (first name + role); figures stay modest and plausible; any prices are sample placeholders. cta/button target is "contact", a page slug, or a section type on this page. Icons must be one of: star, bolt, shield, heart, chart, users, clock, globe, camera, code, leaf, play, mail, pin, gift.'
+      + (assets.length ? ' The visitor uploaded their own photos; the site places them automatically, so do not mention image files.' : '');
+    const user = `Brand: ${plan.name}. Tagline: ${plan.tagline}. About: ${plan.description}. Tone: ${plan.tone || 'confident and friendly'}. This page: ${page.name}. Other pages: ${plan.pages.filter((p, i) => i !== idx).map((p) => p.name).join(', ') || 'none'}. Original request: ${clip(b.prompt, 800)}`;
+    const g = await aiJson(sys, user, 3600, { ...opt, stage: 'page' });
+    const raw = g && g.data;
+    if (!raw || !Array.isArray(raw.sections)) return null;
+    const sections = kit.cleanPageContent(plan, idx, raw);
+    return { html: kit.renderPage(plan, idx, sections, assets), javascript: idx === 0 ? kit.pageJs : '', by: g.by };
   }
   return null;
+}
+
+// ---------- Prompt helper: turns a short idea into a detailed website prompt ----------
+const PROMPT_SYS = 'You write website briefs for an AI website builder. The user gives a short idea (any language, even a few words). Turn it into ONE detailed prompt in English that an AI web designer can build from. Include: the business or brand and its audience; the goal of the site; the pages (max 4) and, for each page, the key sections in order; specific content ideas (real-sounding headings, services or features, and testimonials or pricing only where they fit); the visual style (mood, a colour palette with hex codes, typography feel, imagery approach using CSS shapes or the visitor\'s own uploaded photos); useful features (contact form, WhatsApp button, booking, gallery, and so on, only if they fit); the tone of voice; mobile-first and accessibility requirements. Invent sensible details where the user gave none, but never invent real phone numbers, addresses, claims about real companies or important prices. 180-300 words, plain text paragraphs, no markdown headings, no preamble. If the user wants the website text in a specific language, say so in the prompt. Return ONLY JSON: {"prompt":"..."}';
+async function promptTool(idea) {
+  const user = 'Website idea from the user: ' + idea.slice(0, 600);
+  const schema = { type: 'OBJECT', properties: { prompt: { type: 'STRING' } }, required: ['prompt'] };
+  const keys = geminiKeys(), t0 = Date.now();
+  if (keys.length) {
+    const models = (await geminiModelList(keys[0])).slice(0, 3);
+    for (const k of keys) {
+      for (const m of models) {
+        if (Date.now() - t0 > 30000) break;
+        try {
+          const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k }, signal: AbortSignal.timeout(20000),
+            body: JSON.stringify({ systemInstruction: { parts: [{ text: PROMPT_SYS }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { ...genConfig(m, schema, true), maxOutputTokens: 2000 } }),
+          });
+          if (r.status === 401 || r.status === 403) break; // this key is blocked: next key
+          if (!r.ok) continue;
+          const d = await r.json();
+          const txt = ((d?.candidates?.[0]?.content?.parts) || []).filter((x) => !x.thought).map((x) => x.text || '').join('');
+          const p = JSON.parse(txt).prompt;
+          if (typeof p === 'string' && p.length > 80) return { prompt: p.trim(), via: 'gemini' };
+        } catch (e) {}
+      }
+    }
+  }
+  const g = await aiJson(PROMPT_SYS, user, 1400, { stage: 'plan', deadline: Date.now() + 25000 }); // quiet fallback to the backup AIs: this is a small helper, not a website
+  const p = g && g.data && g.data.prompt;
+  return typeof p === 'string' && p.length > 80 ? { prompt: p.trim(), via: g.by } : null;
 }
 
 async function handler(req, res) {
@@ -285,7 +302,7 @@ async function handler(req, res) {
   if (!keys.length && !haveBackup()) return res.status(500).json({ error: 'config' });
 
   const { mode, prompt, site, page, image, assets, backup, stage } = req.body || {};
-  if (!['generate', 'edit'].includes(mode) || typeof prompt !== 'string' || (prompt.trim().length < 3 && !image) || prompt.length > 4000)
+  if (!['generate', 'edit', 'prompt'].includes(mode) || typeof prompt !== 'string' || (prompt.trim().length < 3 && !image) || prompt.length > 4000)
     return res.status(400).json({ error: 'input' });
   if (image && (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mime) || typeof image.data !== 'string' || image.data.length > 3_000_000 || !/^[A-Za-z0-9+/=]+$/.test(image.data)))
     return res.status(400).json({ error: 'image' });
@@ -294,11 +311,18 @@ async function handler(req, res) {
 
   const ip = String(req.headers['x-forwarded-for'] || 'x').split(',')[0].trim();
   const day = new Date().toISOString().slice(0, 10), k = ip + day + mode; // separate counters for generate and edit
-  const limit = mode === 'generate' ? Number(process.env.GENERATE_LIMIT || 100) : Number(process.env.EDIT_LIMIT || 30), used = hits.get(k) || 0;
+  const limit = mode === 'generate' ? Number(process.env.GENERATE_LIMIT || 100) : mode === 'prompt' ? Number(process.env.PROMPT_LIMIT || 20) : Number(process.env.EDIT_LIMIT || 30), used = hits.get(k) || 0;
   if (used >= limit) return res.status(429).json({ error: 'limit', remaining: 0 });
 
+  if (mode === 'prompt') {
+    if (prompt.length > 600) return res.status(400).json({ error: 'input' });
+    const out = await promptTool(prompt);
+    if (!out) return res.status(503).json({ error: 'busy' });
+    hits.set(k, used + 1);
+    return res.status(200).json(out);
+  }
   if (backup === true && stage && mode === 'generate' && haveBackup()) { // staged backup build (see backupStage)
-    if (!['plan', 'css', 'html', 'polish'].includes(stage)) return res.status(400).json({ error: 'input' });
+    if (!['plan', 'page'].includes(stage)) return res.status(400).json({ error: 'input' });
     const nm = (v) => (typeof v === 'string' && PROVIDERS[v] ? v : undefined);
     const out = await backupStage(stage, req.body, { prefer: nm(req.body.prefer), avoid: nm(req.body.avoid), slot: Number.isInteger(req.body.slot) && req.body.slot > 0 && req.body.slot < 10 ? req.body.slot : 0, deadline: Date.now() + 52000 });
     if (!out) return res.status(503).json({ error: 'busy' });
